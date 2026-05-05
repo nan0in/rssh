@@ -9,5 +9,6 @@ pub mod session;
 pub mod settings;
 pub mod sftp;
 pub mod sync;
+pub mod update;
 #[cfg(not(target_os = "android"))]
 pub mod window;

@@ -392,11 +392,11 @@ const en = {
   "error.window_open_failed": "Open window failed: {err}",
   "error.window_non_https_url": "Refusing non-http(s) URL: {url}",
   "error.window_open_url_failed": "Open URL failed: {err}",
-  "error.window_invalid_repo": "Invalid repo: {repo}",
-  "error.window_http_failed": "HTTP {op} failed: {err}",
-  "error.window_unexpected_redirect": "Unexpected redirect target: {location}",
-  "error.window_redirect_no_location": "Redirect without Location header",
-  "error.window_redirect_status": "Unexpected response status: {status} {body}",
+  "error.update_invalid_repo": "Invalid repo: {repo}",
+  "error.update_http_failed": "HTTP {op} failed: {err}",
+  "error.update_unexpected_redirect": "Unexpected redirect target: {location}",
+  "error.update_redirect_no_location": "Redirect without Location header",
+  "error.update_redirect_status": "Unexpected response status: {status} {body}",
   "error.window_clipboard_failed": "Clipboard {op} failed: {err}",
 
   // ── CLI install (GUI-triggered Tauri commands) ──

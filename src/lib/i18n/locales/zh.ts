@@ -394,11 +394,11 @@ const zh: Messages = {
   "error.window_open_failed": "打开窗口失败：{err}",
   "error.window_non_https_url": "拒绝打开非 http(s) 链接：{url}",
   "error.window_open_url_failed": "打开链接失败：{err}",
-  "error.window_invalid_repo": "仓库格式不合法：{repo}",
-  "error.window_http_failed": "HTTP {op} 失败：{err}",
-  "error.window_unexpected_redirect": "异常重定向目标：{location}",
-  "error.window_redirect_no_location": "重定向缺少 Location header",
-  "error.window_redirect_status": "异常响应状态：{status} {body}",
+  "error.update_invalid_repo": "仓库格式不合法：{repo}",
+  "error.update_http_failed": "HTTP {op} 失败：{err}",
+  "error.update_unexpected_redirect": "异常重定向目标：{location}",
+  "error.update_redirect_no_location": "重定向缺少 Location header",
+  "error.update_redirect_status": "异常响应状态：{status} {body}",
   "error.window_clipboard_failed": "剪贴板 {op} 失败：{err}",
 
   // ── CLI 安装（GUI 触发的 Tauri command） ──
