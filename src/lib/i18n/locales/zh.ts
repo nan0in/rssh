@@ -187,6 +187,8 @@ const zh: Messages = {
 
   // ── AI 排障：ChatPanel ──
   "ai.title": "AI 排障",
+  "ai.title.danger_suffix": "危险模式",
+  "ai.title.danger_tip": "已开启自动执行 —— AI 提议的命令将跳过确认直接运行",
   "ai.toolbar.audit": "✎𓂃审计",
   "ai.toolbar.back_to_chat": "← 对话",
   "ai.toolbar.close_session": "关闭并结束会话",
@@ -198,8 +200,10 @@ const zh: Messages = {
   "ai.input.starting": "启动会话…",
   "ai.input.placeholder": "说说怎么了…  (Enter 发送，Shift+Enter 换行)",
   "ai.input.send": "发送",
+  "ai.input.stop": "⏹ 停止",
   "ai.input.starting_short": "启动中…",
   "ai.session.ended_note": "会话已结束",
+  "ai.bubble.cancelled": "已停止",
 
   // ── AI 排障：AuditPanel ──
   "ai.audit.refresh": "𖦹 刷新",
@@ -267,6 +271,13 @@ const zh: Messages = {
   "ai.settings.note.saved": "已保存",
   "ai.settings.note.save_failed": "保存失败: {error}",
   "ai.settings.section.provider": "PROVIDER & MODEL",
+  "ai.settings.danger.section": "危险模式",
+  "ai.settings.danger.label": "自动执行 AI 提议的命令",
+  "ai.settings.danger.desc": "开启后，AI 提议的每一条命令都会立刻在终端执行，跳过你的确认。仅在可以随时丢弃的虚拟机 / 沙箱环境里启用。Prompt 写错或模型被劫持都可能在几秒内 rm -rf 或外泄数据。",
+  "ai.settings.danger.confirm_title": "⚠️ 确认开启危险模式？",
+  "ai.settings.danger.confirm_body": "AI 提议的每条命令都将立刻执行，跳过你的所有确认。\n\n一条坏命令就能抹掉文件、泄露凭证、把机器搞挂。仅在可随时丢弃的虚拟机 / 沙箱环境里这么做。",
+  "ai.settings.danger.confirm_enable": "确认开启",
+  "ai.settings.danger.save_failed": "保存危险模式失败: {error}",
   "ai.settings.section.skills": "SKILLS",
   "ai.settings.skills.new": "+ 新建",
   "ai.settings.skills.tag.builtin": "内置",

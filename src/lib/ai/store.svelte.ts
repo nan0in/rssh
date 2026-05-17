@@ -129,6 +129,20 @@ export async function sendMessage(session_id: string, text: string) {
   await invoke("ai_user_message", { sessionId: session_id, text });
 }
 
+/** 打断 actor 正在跑的 LLM 流式响应。会话上下文（history / pending command / audit）全部保留——
+ *  这跟 stopSession（销毁整个会话）是两个语义。actor 不在 chat 时调用是 no-op。 */
+export async function cancelStream(session_id: string): Promise<void> {
+  await invoke("ai_cancel_stream", { sessionId: session_id });
+}
+
+/** 当前会话的助手消息是否正在流式输出 —— UI 用它把"发送"按钮切成"停止"。 */
+export function isStreaming(session_id: string): boolean {
+  const arr = _chatBySession[session_id];
+  if (!arr || arr.length === 0) return false;
+  const last = arr[arr.length - 1];
+  return last.kind === "assistant" && last.streaming === true;
+}
+
 /** 在途执行的控制句柄；按 tool_call_id 索引。`terminate` 给 UI 上的"提前终止"按钮用。 */
 const _runningExecutions: Record<string, { terminate: () => Promise<void> }> = {};
 
@@ -173,6 +187,20 @@ export async function executeCommand(
      .replace(/\x1b\][^\x07]*\x07/g, "")
      .replace(/\r/g, "");
 
+  /** 从 PTY buffer 抽出真正给 LLM 看的 output：
+   *  1. 截到 endIndex（sentinel 路径传 sentinel 行起点；terminate/timeout 传整段）
+   *  2. strip ANSI / OSC / CR
+   *  3. 去掉首行（PTY echo 的命令本身——shell 一定会把粘过去的命令回显一遍）
+   *  4. trimEnd（不是 trim——保留前导空白，避免吃掉 `  indented output` 的对齐）
+   *  三条 finish 路径共用此函数，保证上报给 LLM 的格式形态完全一致。 */
+  const extractOutput = (rawBuffer: string, endIndex?: number): string => {
+    const end = Math.max(0, endIndex ?? rawBuffer.length);
+    const stripped = stripAnsi(rawBuffer.substring(0, end));
+    const firstNl = stripped.indexOf("\n");
+    const out = firstNl >= 0 ? stripped.substring(firstNl + 1) : stripped;
+    return out.trimEnd();
+  };
+
   const finish = async (output: string, exit_code: number, timed_out: boolean) => {
     if (resolved) return;
     resolved = true;
@@ -201,26 +229,26 @@ export async function executeCommand(
     const m = sentinelRegex.exec(buffer);
     if (m) {
       const exit = parseInt(m[1], 10);
-      const sentinelLineStart = buffer.lastIndexOf("\n", m.index);
       // sentinel 行之前的部分 = echo 行 + 实际输出
-      let raw = buffer.substring(0, sentinelLineStart >= 0 ? sentinelLineStart : 0);
-      raw = stripAnsi(raw);
-      // 去掉第一行（PTY echo 的命令本身）
-      const firstNl = raw.indexOf("\n");
-      const output = firstNl >= 0 ? raw.substring(firstNl + 1) : raw;
-      void finish(output.trimEnd(), exit, false);
+      const sentinelLineStart = buffer.lastIndexOf("\n", m.index);
+      void finish(extractOutput(buffer, sentinelLineStart), exit, false);
     }
   });
 
-  // 注册控制句柄：用户点"提前终止"时打 Ctrl+C 给 PTY，让 shell 走到 sentinel 那一行
-  // 拿到 130 退出码（SIGINT）。userInterrupted 标志会在 finish() 里上报后端，让 LLM
-  // 区分"命令正常失败"和"用户主动打断"。如果 Ctrl+C 后 shell 半天回不来，timer 兜底。
+  // "提前终止"：用户的诉求是"立刻让我走"，不是"帮我等一个漂亮的退出码"。
+  // Ctrl+C fire-and-forget——shell 能响应就跟着停，不能响应（cat 等 stdin、
+  // 密码 prompt 等吞 SIGINT 的场景）也不扣留用户。立刻 finish，上报
+  // early_terminated=true，LLM 据此知道不该自动重试。
   _runningExecutions[proposed.tool_call_id] = {
     terminate: async () => {
       if (resolved) return;
       userInterrupted = true;
       const ctrlC = Array.from(new TextEncoder().encode("\x03"));
-      await invoke(writeCmd, { sessionId: target_session_id, data: ctrlC });
+      // fire-and-forget 但不要完全吞错——PTY 已关 / session 失联 时 invoke 会 reject，
+      // 留个 warn 痕迹方便排错"我点了终止但 Ctrl+C 好像没发出去"这类反馈。
+      void invoke(writeCmd, { sessionId: target_session_id, data: ctrlC })
+          .catch((err) => console.warn("[ai] terminate Ctrl+C failed:", err));
+      await finish(extractOutput(buffer), -1, false);
     },
   };
 
@@ -236,7 +264,7 @@ export async function executeCommand(
   }
 
   timer = window.setTimeout(() => {
-    void finish(stripAnsi(buffer).trim(), -1, true);
+    void finish(extractOutput(buffer), -1, true);
   }, Math.max(1000, proposed.timeout_s * 1000)) as unknown as number;
 
   return done;
@@ -277,7 +305,7 @@ export async function loadSettings(provider?: LlmProvider): Promise<AiSettings> 
   if (!provider) _settings = snapshot;
   return snapshot;
 }
-export async function saveSettings(s: Partial<{ provider: string; model: string; endpoint: string | null; apiKey: string | null }>) {
+export async function saveSettings(s: Partial<{ provider: string; model: string; endpoint: string | null; apiKey: string | null; dangerMode: boolean }>) {
   await invoke("ai_settings_set", s);
   await loadSettings();
 }
@@ -327,16 +355,31 @@ async function attachListeners(info: AiSessionInfo) {
     }
   }));
 
-  u.push(await listen<{ id: string; text: string }>(`ai:assistant_message_end:${sid}`, (e) => {
+  u.push(await listen<{ id: string; text: string; cancelled?: boolean }>(`ai:assistant_message_end:${sid}`, (e) => {
     const arr = _chatBySession[sid] ?? [];
     for (let i = arr.length - 1; i >= 0; i--) {
       const item = arr[i];
       if (item.kind === "assistant" && item.id === e.payload.id) {
-        // 用 final text 作为权威值（防 delta 漏）；text 空就移除该气泡（纯 tool_use 轮次）
-        if (!e.payload.text || e.payload.text.length === 0) {
+        const isEmpty = !e.payload.text || e.payload.text.length === 0;
+        // cancelled=true 时即使 text 空也要保留气泡——UI 模板会渲染本地化的
+        // "已停止"徽章，告诉用户这一轮被自己打断了。
+        // 只有"纯 tool_use 轮次"（chat 没产文本只产 tool_calls，cancelled=false）
+        // 或 chat 失败（empty + cancelled=false）才移除气泡。
+        if (isEmpty && !e.payload.cancelled) {
           _chatBySession[sid] = [...arr.slice(0, i), ...arr.slice(i + 1)];
         } else {
-          const replaced: ChatItem = { ...item, text: e.payload.text, streaming: false };
+          // 防御：cancel emit 的 payload.text = 后端 captured（sink 累积）；前端 item.text =
+          // 收到的 delta 累积。两者源头一致，正常情况下相等。但 tauri 事件总线异步——
+          // cancel emit 抵达时若 in-flight delta 尚未处理完，payload 反而可能比 item.text
+          // 短；极端退化时甚至为空（chat 刚 start 就 cancel）。用 item.text 兜底，
+          // 避免"用户看着字一行行出来，按停止后只剩个徽章"。
+          const finalText = e.payload.text || item.text;
+          const replaced: ChatItem = {
+            ...item,
+            text: finalText,
+            streaming: false,
+            cancelled: e.payload.cancelled === true,
+          };
           _chatBySession[sid] = [...arr.slice(0, i), replaced, ...arr.slice(i + 1)];
         }
         return;

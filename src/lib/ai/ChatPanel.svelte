@@ -22,6 +22,11 @@
 
     let session = $derived(ai.sessionForTarget(targetId));
     let items: ChatItem[] = $derived(session ? ai.chatItems(session.session_id) : []);
+    // 流式响应进行中 —— send 按钮换成"停止"按钮。依赖 items 变化重算（last item 的 streaming flag）。
+    let streaming = $derived(session ? ai.isStreaming(session.session_id) : false);
+    // 危险模式标记 —— 用户在 AI Settings 里切换后，标题旁的红色后缀立刻同步。
+    // 走 ai.settings() 读 store 的 $state，自动响应式（不需要手动 loadSettings 触发）。
+    let dangerMode = $derived(ai.settings()?.danger_mode === true);
 
     onMount(() => {
         if (!ai.settings()) ai.loadSettings().catch(() => {});
@@ -74,6 +79,19 @@
         ai.closePanel();
     }
 
+    /** 打断当前流式响应；会话上下文保留，用户可立刻发下一条纠正。 */
+    async function stopStreaming() {
+        if (!session) return;
+        try {
+            await ai.cancelStream(session.session_id);
+        } catch (e) {
+            // 不能只 console.error 就完事——失败的话用户还卡在 streaming/disabled 状态，
+            // 看不到任何错误反馈。复用 banner 让用户知道"停止没生效，再点一次或刷新"。
+            console.error("[ai] cancel stream:", e);
+            banner = errMsg(e);
+        }
+    }
+
     function onKeyDown(e: KeyboardEvent) {
         if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -89,6 +107,9 @@
 <div class="ai-panel">
     <div class="toolbar">
         <span class="title">{t("ai.title")}</span>
+        {#if dangerMode}
+            <span class="title-danger" title={t("ai.title.danger_tip")}>{t("ai.title.danger_suffix")}</span>
+        {/if}
         {#if session}
             <button class="btn btn-ghost btn-sm" onclick={() => (auditOpen = !auditOpen)}>
                 {auditOpen ? t("ai.toolbar.back_to_chat") : t("ai.toolbar.audit")}
@@ -117,8 +138,15 @@
                     {:else if item.kind === "assistant"}
                         <div class="ts">{fmt(item.at)}</div>
                         <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                        <div class="bubble assistant md" class:streaming={item.streaming}>
-                            {@html renderMarkdown(item.text || "…")}
+                        <div class="bubble assistant md" class:streaming={item.streaming} class:cancelled={item.cancelled}>
+                            {#if item.text}
+                                {@html renderMarkdown(item.text)}
+                            {:else if !item.cancelled}
+                                …
+                            {/if}
+                            {#if item.cancelled}
+                                <span class="cancelled-tag">{t("ai.bubble.cancelled")}</span>
+                            {/if}
                         </div>
                     {:else if item.kind === "command" && session}
                         <CommandConfirmDialog
@@ -149,13 +177,20 @@
             <textarea
                 bind:this={inputEl}
                 bind:value={inputText}
-                placeholder={busy ? (session ? t("ai.input.replying") : t("ai.input.starting")) : t("ai.input.placeholder")}
+                placeholder={busy ? (session ? t("ai.input.replying") : t("ai.input.starting")) : (streaming ? t("ai.input.replying") : t("ai.input.placeholder"))}
                 onkeydown={onKeyDown}
                 disabled={busy}
+                readonly={streaming}
             ></textarea>
-            <button class="btn btn-primary" onclick={send} disabled={!inputText.trim() || busy}>
-                {busy && !session ? t("ai.input.starting_short") : t("ai.input.send")}
-            </button>
+            {#if streaming}
+                <button class="btn btn-stop" onclick={stopStreaming} title={t("ai.input.stop")}>
+                    {t("ai.input.stop")}
+                </button>
+            {:else}
+                <button class="btn btn-primary" onclick={send} disabled={!inputText.trim() || busy}>
+                    {busy && !session ? t("ai.input.starting_short") : t("ai.input.send")}
+                </button>
+            {/if}
         </div>
     {/if}
 </div>
@@ -175,9 +210,25 @@
         flex-shrink: 0;
     }
     .title { font-weight: 600; font-size: 13px; }
+    .title-danger {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--error);
+        padding: 1px 6px;
+        border: 1px solid var(--error);
+        border-radius: 3px;
+        background: color-mix(in srgb, var(--error) 8%, transparent);
+    }
     .grow { flex: 1; }
     .btn-primary { background: var(--accent); color: var(--white); border-color: var(--accent); }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-stop {
+        background: var(--error);
+        color: var(--white);
+        border-color: var(--error);
+        cursor: pointer;
+    }
+    .btn-stop:hover { opacity: 0.85; }
     .btn-ghost { background: transparent; }
     .btn-icon {
         background: transparent; border: none;
@@ -227,6 +278,19 @@
     }
     .bubble.assistant.streaming {
         position: relative;
+    }
+    /* 用户打断的响应：气泡尾部跟一个本地化小徽章，区别于"AI 自己结束的对话"。
+       徽章本身在 ChatPanel 模板里用 i18n 渲染，避免把英文 marker 硬塞进 LLM 输出文本。 */
+    .cancelled-tag {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: color-mix(in srgb, var(--text-dim) 18%, transparent);
+        color: var(--text-dim);
+        font-size: 10.5px;
+        font-weight: 500;
+        vertical-align: middle;
     }
     .bubble.assistant.streaming::after {
         content: "▋";

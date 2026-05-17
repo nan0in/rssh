@@ -17,6 +17,8 @@ export interface AiSettings {
   model: string;
   endpoint: string | null;
   has_api_key: boolean;
+  /** 危险模式：跳过 CommandConfirmDialog 确认，AI 提议命令直接执行。默认 false。 */
+  danger_mode: boolean;
 }
 
 export interface ModelInfo {
@@ -35,7 +37,7 @@ export interface AiSessionInfo {
 /** 一条对话消息（前端展示用） */
 export type ChatItem =
   | { kind: "user"; text: string; at: number }
-  | { kind: "assistant"; id: string; text: string; at: number; streaming: boolean }
+  | { kind: "assistant"; id: string; text: string; at: number; streaming: boolean; cancelled?: boolean }
   | { kind: "command"; cmd: CommandProposed; at: number; result?: CommandResult; rejected?: { reason: string } }
   | { kind: "error"; text: string; at: number }
   | { kind: "note"; text: string; at: number };

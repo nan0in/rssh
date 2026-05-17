@@ -190,7 +190,10 @@ export function isTermPaletteRef(v: unknown): v is TermPaletteRef {
  * iTerm2-Color-Schemes/xterm folder exports. Required keys: background,
  * foreground. ANSI 16 are recommended; missing ones fall back to xterm
  * defaults at render time, so we don't reject on those — and PaletteTerm
- * marks them optional, so the cast below is type-safe (no force cast).
+ * marks them optional. We validate background/foreground above and drop
+ * any non-string fields below, so the runtime shape conforms to PaletteTerm;
+ * the `unknown` hop in the final cast is purely a TS overlap-rule workaround
+ * (TS can't see "we've cleaned this Record" without it), not a force cast.
  */
 export function parseCustomTermJson(raw: string): PaletteTerm {
   let parsed: unknown;
@@ -228,5 +231,9 @@ export function parseCustomTermJson(raw: string): PaletteTerm {
   for (const k of Object.keys(term)) {
     if (typeof term[k] !== "string") delete term[k];
   }
-  return term as PaletteTerm;
+  // 经过上面两轮清洗（alias 重命名 + 非字符串字段删除）+ 顶部 background/foreground 校验，
+  // `term` 此刻只含 string 字段且 background/foreground 必存。`Record<string, unknown>`
+  // 与 `PaletteTerm` 在 TS 看来没足够 overlap（前者完全开放、后者有具名 optional 字段），
+  // 所以需要先绕一道 `unknown` —— 不是 hack，是显式承认"运行期校验过、类型层无法表达"。
+  return term as unknown as PaletteTerm;
 }

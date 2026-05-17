@@ -30,6 +30,12 @@ fn key_endpoint(provider: &str) -> String {
 fn key_api_key(provider: &str) -> String {
     setting_key(&format!("ai_{provider}_key"))
 }
+/// 危险模式（全局，不分 provider）：开启后前端跳过 CommandConfirmDialog 的人工确认，
+/// AI 提议的命令直接 auto-approve。这是 issue #39 的明确需求——用户在受控环境
+/// （隔离 VM、靶机）里期望像 Claude Code 一样无打扰自主跑。
+fn key_danger_mode() -> String {
+    setting_key("ai_danger_mode")
+}
 
 // ─── 命令 ──────────────────────────────────────────────────────────
 
@@ -256,6 +262,31 @@ pub async fn ai_session_stop(state: State<'_, AppState>, session_id: String) -> 
     Ok(())
 }
 
+/// 取消当前正在进行的 LLM 流式响应。仅当 actor 阻塞在 chat() 时有效；
+/// 否则 slot 为 None，这是 no-op（不算错——用户也可能恰好在响应完结那一刻按下）。
+/// 会话本身（history / pending command / audit）全部保留。
+#[tauri::command]
+pub async fn ai_cancel_stream(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    let slot = locked(&state.ai_sessions)?
+        .get(&session_id)
+        .map(|s| s.cancel_slot.clone())
+        .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
+    // 先把 Notify clone 出来再释放锁——slot 用的是 std::sync::Mutex，
+    // 持锁期间调 notify_one 阻塞 actor 端尝试清空 slot 的同一把锁。
+    // 用代码块限定 guard 生命周期，notify_one 在 lock 释放后才执行。
+    let notify = {
+        let g = slot.lock().map_err(|_| AppError::Lock)?;
+        g.as_ref().cloned()
+    };
+    if let Some(n) = notify {
+        n.notify_one();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn ai_audit_save(
     state: State<'_, AppState>,
@@ -339,6 +370,8 @@ pub struct AiSettings {
     pub model: String,
     pub endpoint: Option<String>,
     pub has_api_key: bool,
+    /// 全局（不随 provider 切换）。前端 toggle，开启后跳过命令确认对话框。
+    pub danger_mode: bool,
 }
 
 /// `provider` 入参：传 `Some(p)` → 拉该 provider 的快照（不改 active）；
@@ -365,11 +398,17 @@ pub async fn ai_settings_get(
         .get(&key_api_key(&provider))?
         .filter(|s| !s.is_empty())
         .is_some();
+    let danger_mode = state
+        .secret_store
+        .get(&key_danger_mode())?
+        .map(|v| v == "1")
+        .unwrap_or(false);
     Ok(AiSettings {
         provider,
         model,
         endpoint,
         has_api_key,
+        danger_mode,
     })
 }
 
@@ -409,6 +448,7 @@ pub async fn ai_settings_set(
     model: Option<String>,
     endpoint: Option<String>,
     api_key: Option<String>,
+    danger_mode: Option<bool>,
 ) -> AppResult<()> {
     if let Some(p) = provider.as_ref() {
         state.secret_store.set(&key_provider(), p)?;
@@ -431,6 +471,13 @@ pub async fn ai_settings_set(
         } else {
             state.secret_store.set(&key_api_key(&active_provider), &k)?;
         }
+    }
+    if let Some(on) = danger_mode {
+        // 用 "1"/"0" 而不是 delete on false——显式记录用户的"我关了"，
+        // 与"从未设置过"区分开，后续审计/排错更直接。
+        state
+            .secret_store
+            .set(&key_danger_mode(), if on { "1" } else { "0" })?;
     }
     Ok(())
 }

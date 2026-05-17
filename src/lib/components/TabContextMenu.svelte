@@ -47,12 +47,16 @@
 
 <svelte:window onkeydown={handleKeydown}/>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<!-- svelte-ignore a11y_click_events_have_key_events -->
+<!-- backdrop = 纯遮罩，键盘用户走顶层 Escape（handleKeydown）退出，不需要键盘 click 等价物 -->
 <div class="ctx-backdrop"
      onclick={onClose}
-     oncontextmenu={(e) => { e.preventDefault(); onClose(); }}></div>
+     oncontextmenu={(e) => { e.preventDefault(); onClose(); }}
+     role="presentation"></div>
 
+<!-- 故意不用 role="menu" / "menuitem"——那两个 role 暗示完整 ARIA menu pattern
+     （方向键导航 + roving tabindex），但本组件只有 Esc 关闭，假装是 menu 会让屏幕阅读器
+     用户期待方向键导航却得不到。承认它就是一组上下文按钮：<button> 默认就是 button 角色，
+     Tab 键可遍历、Enter/Space 可激活，简单诚实。 -->
 <div class="ctx-menu surface-raised"
      class:ready
      bind:this={menuEl}
