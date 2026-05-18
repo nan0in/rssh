@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { t, locale as currentLocale } from "../i18n/index.svelte.ts";
+import { extractOutput, findSentinel } from "./pty-output.ts";
 import type {
   AiSessionInfo,
   AiSettings,
@@ -178,29 +179,6 @@ export async function executeCommand(
   let resolveDone!: () => void;
   const done = new Promise<void>((r) => { resolveDone = r; });
 
-  const sentinelRegex = new RegExp(
-    proposed.sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(-?\\d+)"
-  );
-
-  const stripAnsi = (s: string) =>
-    s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
-     .replace(/\x1b\][^\x07]*\x07/g, "")
-     .replace(/\r/g, "");
-
-  /** 从 PTY buffer 抽出真正给 LLM 看的 output：
-   *  1. 截到 endIndex（sentinel 路径传 sentinel 行起点；terminate/timeout 传整段）
-   *  2. strip ANSI / OSC / CR
-   *  3. 去掉首行（PTY echo 的命令本身——shell 一定会把粘过去的命令回显一遍）
-   *  4. trimEnd（不是 trim——保留前导空白，避免吃掉 `  indented output` 的对齐）
-   *  三条 finish 路径共用此函数，保证上报给 LLM 的格式形态完全一致。 */
-  const extractOutput = (rawBuffer: string, endIndex?: number): string => {
-    const end = Math.max(0, endIndex ?? rawBuffer.length);
-    const stripped = stripAnsi(rawBuffer.substring(0, end));
-    const firstNl = stripped.indexOf("\n");
-    const out = firstNl >= 0 ? stripped.substring(firstNl + 1) : stripped;
-    return out.trimEnd();
-  };
-
   const finish = async (output: string, exit_code: number, timed_out: boolean) => {
     if (resolved) return;
     resolved = true;
@@ -226,13 +204,8 @@ export async function executeCommand(
     if (resolved) return;
     const chunk = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(e.payload));
     buffer += chunk;
-    const m = sentinelRegex.exec(buffer);
-    if (m) {
-      const exit = parseInt(m[1], 10);
-      // sentinel 行之前的部分 = echo 行 + 实际输出
-      const sentinelLineStart = buffer.lastIndexOf("\n", m.index);
-      void finish(extractOutput(buffer, sentinelLineStart), exit, false);
-    }
+    const hit = findSentinel(buffer, proposed.sentinel);
+    if (hit) void finish(hit.output, hit.exitCode, false);
   });
 
   // "提前终止"：用户的诉求是"立刻让我走"，不是"帮我等一个漂亮的退出码"。
