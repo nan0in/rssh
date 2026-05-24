@@ -53,6 +53,20 @@ export interface CommandProposed {
   explain: string;
   side_effect: string;
   timeout_s: number;
+  /**
+   * 工具来源标记：
+   * - undefined  普通 run_command / read-only file_op（match_file）。danger_mode 可自动批准。
+   * - "patch_file"  patch_file 的写操作卡片（cp / modify / diff / mv 全 4 张都打这个）。
+   *   即便 danger_mode 也强制人审 —— 文件改动比 run_command 风险高，"接受命令风险"不等于
+   *   "接受任意文件改动"，必须每张卡片亲手 approve。
+   */
+  kind?: "patch_file";
+  /**
+   * patch_file 第 4 张 mv 卡片携带的 diff 文本（来自第 3 张 diff 命令的输出）——
+   * 让用户审批 mv 时直接在卡片上看到 diff，不用回滚翻第 3 张的 result 区域。
+   * 其他卡片不带（undefined）。
+   */
+  diff?: string;
 }
 
 export interface CommandResult {

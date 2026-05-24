@@ -42,6 +42,12 @@ let _chatBySession = $state<Record<string, ChatItem[]>>({});
 let _pendingByTarget = $state<Record<string, CommandProposed | null>>({});
 let _keyboardLockedByTarget = $state<Record<string, boolean>>({});
 let _settings = $state<AiSettings | null>(null);
+/**
+ * target_id → 终端类型映射。internal_command 自动执行时需要知道走 ssh_write
+ * 还是 pty_write —— ChatPanel 把 targetKind 作为 prop 传给 dialog，但 store
+ * 在 attachListeners 里要独立处理 internal_command 事件，所以单独缓存。
+ */
+const _targetKindByTarget: Record<string, "ssh" | "local"> = {};
 
 const _unlisteners: Record<string, UnlistenFn[]> = {};
 
@@ -104,7 +110,12 @@ export async function startSession(args: {
     model: args.model,
     locale: currentLocale(),
   });
-  _sessionByTarget[args.targetId] = info;
+  // 用 info.target_id 作 key 而非 args.targetId —— attachListeners / internal_command
+  // 读 cache 时用 tid = info.target_id（见 attachListeners）。若两者哪天不一致（后端
+  // normalize 了 target_id），cache miss → internal_command 走 fail-closed 报错。统一用
+  // 后端权威的 info.target_id 消除分裂。
+  _sessionByTarget[info.target_id] = info;
+  _targetKindByTarget[info.target_id] = args.targetKind;
   _chatBySession[info.session_id] = [];
   _activeSessionId = info.session_id;
   await attachListeners(info);
@@ -120,6 +131,7 @@ export async function stopSession(session_id: string) {
       delete _sessionByTarget[tid];
       delete _pendingByTarget[tid];
       delete _keyboardLockedByTarget[tid];
+      delete _targetKindByTarget[tid];
     }
   }
   delete _chatBySession[session_id];
@@ -363,6 +375,67 @@ async function attachListeners(info: AiSessionInfo) {
   u.push(await listen<CommandProposed>(`ai:command_proposed:${sid}`, (e) => {
     _pendingByTarget[tid] = e.payload;
     pushChat(sid, { kind: "command", cmd: e.payload, at: Date.now() });
+  }));
+
+  // internal_command：当前只用于 file_ops 工具的远端能力探测（一行只读 echo "py3=... perl=... diff=..."）。
+  // 不弹审批、不入 chat 时间线，直接粘到 PTY 跑——用户在终端历史里看到探测命令滚过，
+  // 透明但不打断流程。后续若加其他 read-only 内部命令也走这条路径。
+  u.push(await listen<{
+    id: string;
+    tool_call_id: string;
+    cmd: string;
+    full_cmd: string;
+    sentinel: string;
+  }>(`ai:internal_command:${sid}`, async (e) => {
+    const kind = _targetKindByTarget[tid];
+    if (!kind) {
+      // fail-closed：必须给后端回一个 result，否则 wait_command_outcome 永远阻塞，
+      // session actor 卡在 file_ops handler 里 await 不出来，整个 AI 会话挂死。
+      const msg = `internal_command without target_kind for ${tid}`;
+      console.error("[ai]", msg);
+      try {
+        await invoke("ai_command_result", {
+          sessionId: sid,
+          toolCallId: e.payload.tool_call_id,
+          exitCode: -1,
+          output: msg,
+          timedOut: false,
+          earlyTerminated: false,
+        });
+      } catch (err) {
+        console.error("[ai] failed to report internal_command target_kind miss:", err);
+      }
+      return;
+    }
+    const proposed: CommandProposed = {
+      id: e.payload.id,
+      tool_call_id: e.payload.tool_call_id,
+      cmd: e.payload.cmd,
+      full_cmd: e.payload.full_cmd,
+      sentinel: e.payload.sentinel,
+      explain: "",
+      side_effect: "",
+      timeout_s: 60,
+    };
+    try {
+      await executeCommand(sid, proposed, kind, tid);
+    } catch (err) {
+      // executeCommand 在 PTY listen 失败等情况下可能在自己发 ai_command_result 之前就抛。
+      // 不补一个失败 result，wait_command_outcome 会永挂在 Rust 侧。
+      console.error("[ai] internal_command exec failed:", err);
+      try {
+        await invoke("ai_command_result", {
+          sessionId: sid,
+          toolCallId: e.payload.tool_call_id,
+          exitCode: -1,
+          output: err instanceof Error ? err.message : String(err),
+          timedOut: false,
+          earlyTerminated: false,
+        });
+      } catch (reportErr) {
+        console.error("[ai] failed to report internal_command exec failure:", reportErr);
+      }
+    }
   }));
 
   u.push(await listen<{ id: string; lock_keyboard: boolean }>(`ai:command_executing:${sid}`, (e) => {

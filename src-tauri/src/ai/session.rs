@@ -23,7 +23,30 @@ use super::audit::{AuditKind, AuditLog};
 use super::llm::{ChatDelta, ChatMessage, ChatRequest, DeltaSink, LlmClient, ToolCall};
 use super::sanitize::{self, RedactRule};
 use super::skills::SkillRecord;
-use super::tools::{self, AnalyzeLocallyInput, DownloadFileInput, LoadSkillInput, RunCommandInput};
+use super::tools::{
+    self, AnalyzeLocallyInput, DownloadFileInput, LoadSkillInput, RunCommandInput,
+};
+
+mod file_ops;
+
+use file_ops::RemoteCapabilities;
+
+
+/// 工具命令在前端 PTY 跑完后的两种结果。file_ops 子模块的 `run_file_op` 也用它。
+#[derive(Debug)]
+pub(in crate::ai::session) enum CommandOutcome {
+    Result {
+        exit_code: i32,
+        output: String,
+        #[allow(dead_code)]
+        timed_out: bool,
+        #[allow(dead_code)]
+        early_terminated: bool,
+    },
+    Rejected {
+        reason: String,
+    },
+}
 
 /// SFTP 下载硬上限。LLM 不可信，rssh 在边界 enforce：超过 100MB 一律不走 SFTP。
 /// 用户要分析更大的 artifact（GB-scale heap dump 等），人工 scp/rsync 拉到本地后
@@ -122,20 +145,27 @@ pub fn start(cfg: SessionConfig, app: AppHandle) -> AppResult<DiagnoseSession> {
         audit,
         app,
         cancel_slot,
+        remote_caps: None,
     };
     tauri::async_runtime::spawn(actor.run());
 
     Ok(session)
 }
 
-struct Actor {
-    cfg: SessionConfig,
+pub(in crate::ai::session) struct Actor {
+    /// pub(in crate::ai::session) 给 `file_ops` 子模块的 `impl Actor` 访问 cfg.redact_rules / cfg.max_output_bytes
+    pub(in crate::ai::session) cfg: SessionConfig,
     system_prompt: String,
-    history: Vec<ChatMessage>,
+    /// pub(in crate::ai::session) 给 file_ops handlers push ToolResult
+    pub(in crate::ai::session) history: Vec<ChatMessage>,
     action_rx: mpsc::UnboundedReceiver<UserAction>,
     audit: Arc<Mutex<AuditLog>>,
     app: AppHandle,
     cancel_slot: Arc<Mutex<Option<Arc<Notify>>>>,
+    /// 远端 file_ops 能力 — lazy 探测，session 内缓存。
+    /// None = 还没探测；Some = 已探测，结果有效到 session 结束。
+    /// pub(in crate::ai::session) 给 `file_ops::Actor::ensure_remote_caps` 读写。
+    pub(in crate::ai::session) remote_caps: Option<RemoteCapabilities>,
 }
 
 impl Actor {
@@ -336,9 +366,72 @@ impl Actor {
             tools::TOOL_LOAD_SKILL => self.handle_load_skill(tc).await,
             tools::TOOL_DOWNLOAD_FILE => self.handle_download_file(tc).await,
             tools::TOOL_ANALYZE_LOCALLY => self.handle_analyze_locally(tc).await,
+            tools::TOOL_MATCH_FILE => self.handle_match_file(tc).await,
+            tools::TOOL_PATCH_FILE => self.handle_patch_file(tc).await,
             other => {
                 self.push_tool_error(&tc.id, &format!("Unknown tool: {other}"));
                 Ok(())
+            }
+        }
+    }
+
+    /// 等待前端汇报命令结果或拒绝。
+    ///
+    /// 命令的 emit 由调用方做（不同工具走不同事件：`internal_command` 不弹审批，
+    /// `command_proposed` 弹审批）。本函数只负责等结果回报。
+    ///
+    /// `pub(in crate::ai::session)` 给 `file_ops` 子模块的 `ensure_remote_caps` / `run_file_op` 共用。
+    /// `handle_run_command` 用自己的 loop（要做不同的 audit/emit）—— 没复用这里。
+    pub(in crate::ai::session) async fn wait_command_outcome(
+        &mut self,
+        tool_call_id: &str,
+    ) -> AppResult<CommandOutcome> {
+        loop {
+            let action = match self.action_rx.recv().await {
+                Some(a) => a,
+                None => return Err(AppError::other("session_channel_closed", json!({}))),
+            };
+            match action {
+                UserAction::CommandResult {
+                    tool_call_id: rid,
+                    exit_code,
+                    output,
+                    timed_out,
+                    early_terminated,
+                } if rid == tool_call_id => {
+                    return Ok(CommandOutcome::Result {
+                        exit_code,
+                        output,
+                        timed_out,
+                        early_terminated,
+                    });
+                }
+                UserAction::RejectCommand {
+                    tool_call_id: rid,
+                    reason,
+                } if rid == tool_call_id => {
+                    return Ok(CommandOutcome::Rejected { reason });
+                }
+                UserAction::Stop => {
+                    return Err(AppError::other("session_stopped_user", json!({})));
+                }
+                UserAction::Message(text) => {
+                    // 工具调用中拒绝新消息（同 handle_run_command 现有行为）
+                    let redacted = sanitize::redact(&text, &self.cfg.redact_rules);
+                    self.audit_push(AuditKind::Note {
+                        message: format!(
+                            "user message dropped during tool call {tool_call_id}: {redacted}"
+                        ),
+                    });
+                    self.emit(
+                        "error",
+                        json!({
+                            "message": "工具正在运行，无法发送新消息。请等待结果，或在命令卡片上批准 / 拒绝。",
+                        }),
+                    );
+                    continue;
+                }
+                _ => continue,
             }
         }
     }
@@ -755,7 +848,7 @@ impl Actor {
         }
     }
 
-    fn push_tool_error(&mut self, tool_call_id: &str, msg: &str) {
+    pub(in crate::ai::session) fn push_tool_error(&mut self, tool_call_id: &str, msg: &str) {
         self.history.push(ChatMessage::ToolResult {
             tool_call_id: tool_call_id.to_string(),
             content: msg.to_string(),
@@ -766,14 +859,15 @@ impl Actor {
         });
     }
 
-    fn audit_push(&self, kind: AuditKind) {
+    pub(in crate::ai::session) fn audit_push(&self, kind: AuditKind) {
         if let Ok(mut g) = self.audit.lock() {
             g.push(kind);
         }
     }
 
-    fn emit(&self, kind: &str, payload: serde_json::Value) {
+    pub(in crate::ai::session) fn emit(&self, kind: &str, payload: serde_json::Value) {
         let event = format!("ai:{kind}:{}", self.cfg.session_id);
         let _ = self.app.emit(&event, payload);
     }
 }
+
