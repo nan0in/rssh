@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,15 +11,43 @@ use crate::error::{AppError, AppResult};
 use crate::models::Credential;
 use crate::ssh::client;
 
-/// 用户取消时返回的 i18n code。前端 transfers.svelte.ts 通过 `errStr.includes(...)`
-/// 匹配此字面值识别"用户取消"。改名时前后端必须同步。
+/// i18n code returned when the user cancels a transfer. The frontend
+/// (transfers.svelte.ts) matches this literal via `errStr.includes(...)` to
+/// flip the status to "cancelled". Keep the constant in sync across both ends.
 pub const CANCELLED_CODE: &str = "transfer_cancelled";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEntry {
     pub name: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub size: u64,
+    /// unix epoch seconds; 0 means the server did not provide an mtime
+    pub mtime: u64,
+}
+
+/// Flat walk output. `rel_path` is always '/'-separated (even when the host is
+/// Windows); the frontend swaps separators when joining the local path.
+#[derive(Debug, Clone, Serialize)]
+pub struct WalkEntry {
+    pub rel_path: String,
+    pub size: u64,
+}
+
+/// Maximum recursion depth, counting the root as depth 0. With CAP = 32 the
+/// walker accepts paths up to 32 segments deep (root through depth 31) and
+/// fails the whole command at depth 32 — guards against symlink cycles and
+/// pathological server-side trees.
+const WALK_DEPTH_CAP: u32 = 32;
+
+/// Join a remote path segment. Special-cases dir == "/" so the result never
+/// contains "//foo"; matches the convention used by the existing callers.
+fn join_remote(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), name)
+    }
 }
 
 pub struct SftpHandle {
@@ -112,9 +141,15 @@ impl SftpHandle {
         let mut result: Vec<RemoteEntry> = entries
             .map(|e| {
                 let name = e.file_name();
-                let is_dir = e.file_type().is_dir();
-                let size = e.metadata().size.unwrap_or(0);
-                RemoteEntry { name, is_dir, size }
+                let ft = e.file_type();
+                let meta = e.metadata();
+                RemoteEntry {
+                    name,
+                    is_dir: ft.is_dir(),
+                    is_symlink: ft.is_symlink(),
+                    size: meta.size.unwrap_or(0),
+                    mtime: meta.mtime.map(u64::from).unwrap_or(0),
+                }
             })
             .collect();
 
@@ -124,6 +159,71 @@ impl SftpHandle {
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
+        Ok(result)
+    }
+
+    /// Recursively list every downloadable file under `root`, returning a flat
+    /// list of (relative path, size).
+    ///
+    /// - BFS to avoid blowing the stack on deep trees.
+    /// - Symlink-to-file: follow once for size, treat as a regular file.
+    ///   Symlink-to-dir: skipped to prevent loops.
+    /// - Depth exceeding `WALK_DEPTH_CAP` fails the whole command.
+    /// - Per-file failures are not handled here: each file is later dispatched
+    ///   as an independent Transfer, which owns its own retry/cancel surface.
+    ///   This function only builds the work list.
+    pub async fn walk_files(&self, root: &str) -> AppResult<Vec<WalkEntry>> {
+        let root_norm = root.trim_end_matches('/').to_string();
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+        queue.push_back((root.to_string(), 0));
+        let mut result: Vec<WalkEntry> = Vec::new();
+
+        while let Some((dir, depth)) = queue.pop_front() {
+            if depth >= WALK_DEPTH_CAP {
+                return Err(AppError::sftp(
+                    "sftp_tree_too_deep",
+                    json!({ "path": dir, "depth": depth, "limit": WALK_DEPTH_CAP }),
+                ));
+            }
+            let entries = self.sftp.read_dir(&dir).await.map_err(|e| {
+                AppError::sftp(
+                    "sftp_io_failed",
+                    json!({ "op": "read_dir", "path": dir, "err": e.to_string() }),
+                )
+            })?;
+            for e in entries {
+                let name = e.file_name();
+                let full = join_remote(&dir, &name);
+                let rel = full
+                    .strip_prefix(&root_norm)
+                    .unwrap_or(&full)
+                    .trim_start_matches('/')
+                    .to_string();
+                let ft = e.file_type();
+                if ft.is_dir() {
+                    queue.push_back((full, depth + 1));
+                } else if ft.is_file() {
+                    result.push(WalkEntry {
+                        rel_path: rel,
+                        size: e.metadata().size.unwrap_or(0),
+                    });
+                } else if ft.is_symlink() {
+                    // Follow once via STAT to learn what the target is.
+                    if let Ok(meta) = self.sftp.metadata(&full).await {
+                        if meta.file_type().is_file() {
+                            result.push(WalkEntry {
+                                rel_path: rel,
+                                size: meta.size.unwrap_or(0),
+                            });
+                        }
+                        // symlink-to-dir: skip to avoid cycles.
+                        // anything else (block/char/fifo): skip.
+                    }
+                    // metadata failure (e.g. broken symlink): silently skip.
+                }
+                // Other types (block/char/fifo) are skipped.
+            }
+        }
         Ok(result)
     }
 
@@ -257,8 +357,6 @@ impl SftpHandle {
         transfer_id: &str,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
-        use tauri::Emitter;
-
         // Get file size for progress
         let meta = self
             .sftp
@@ -273,11 +371,67 @@ impl SftpHandle {
             .await
             .map_err(|e| AppError::sftp("sftp_io_failed", json!({ "op": "open", "err": e.to_string() })))?;
 
-        let mut local_file = tokio::fs::File::create(local_path).await?;
+        // For multi-select downloads, local_path may live inside a subdirectory
+        // we haven't created yet (e.g. <pick_dir>/<root>/<subdir>/file.txt).
+        // For a single-file download the parent already exists, so
+        // create_dir_all is a no-op.
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
+        // Atomicity: write to `<local_path>.part` first; rename to final name
+        // only on full success. Cancel / read-error / write-error all leave
+        // only a partial `.part` (cleaned up below) — never a truncated file
+        // sitting where users might pick it up. Mirrors `download_to_path`.
+        let file_name = local_path
+            .file_name()
+            .ok_or_else(|| AppError::sftp("sftp_invalid_filename", json!({})))?
+            .to_string_lossy()
+            .into_owned();
+        let tmp_path = local_path.with_file_name(format!("{file_name}.part"));
+
+        let result = self
+            .stream_to_part(&mut remote_file, &tmp_path, total, app, transfer_id, cancel)
+            .await;
+        match result {
+            Ok(transferred) => {
+                // Best-effort: remove any pre-existing destination so rename
+                // doesn't fail on Windows (Unix rename overwrites silently).
+                let _ = tokio::fs::remove_file(local_path).await;
+                tokio::fs::rename(&tmp_path, local_path).await?;
+                let _ = remote_file
+                    .shutdown()
+                    .await
+                    .map_err(|e| AppError::sftp("sftp_io_failed", json!({ "op": "close", "err": e.to_string() })));
+                Ok(transferred)
+            }
+            Err(e) => {
+                // Best-effort cleanup; even if unlink fails we just leak `.part`.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner streaming loop for `download_streaming`. Writes to the supplied
+    /// temp path and emits progress events; the caller decides whether to
+    /// promote `.part` to the final name or clean it up.
+    async fn stream_to_part(
+        &self,
+        remote_file: &mut russh_sftp::client::fs::File,
+        tmp_path: &Path,
+        total: u64,
+        app: &tauri::AppHandle,
+        transfer_id: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> AppResult<u64> {
+        use tauri::Emitter;
+
+        let mut local_file = tokio::fs::File::create(tmp_path).await?;
         let mut transferred: u64 = 0;
         let mut buf = vec![0u8; 32768];
-        // 事件名每个 chunk emit 一次；预算一次避免循环里反复 String 分配。
+        // Build the event name once; we emit on every chunk and want to avoid
+        // repeated String allocations inside the loop.
         let event = format!("sftp:progress:{transfer_id}");
 
         loop {
@@ -291,22 +445,59 @@ impl SftpHandle {
             if n == 0 {
                 break;
             }
-
             local_file.write_all(&buf[..n]).await?;
             transferred += n as u64;
-
             let _ = app.emit(
                 &event,
                 serde_json::json!({ "transferred": transferred, "total": total }),
             );
         }
-
-        remote_file
-            .shutdown()
-            .await
-            .map_err(|e| AppError::sftp("sftp_io_failed", json!({ "op": "close", "err": e.to_string() })))?;
-
         Ok(transferred)
+    }
+
+    /// Remote `mkdir -p`: ensure every ancestor directory of `path` exists.
+    ///
+    /// Concurrency note: under MAX_CONCURRENT uploads several tasks may race
+    /// to create the same shared subdirectory. We therefore *blindly attempt*
+    /// `create_dir` per segment and, on failure, fall back to a metadata probe.
+    /// If a directory is now present, treat it as success (a peer created it);
+    /// otherwise propagate the original create error. This trades a few extra
+    /// SFTP round-trips on the cold path for race-freeness — `mkdir_p` is
+    /// already off the hot single-file path because callers short-circuit
+    /// when the parent already exists.
+    async fn mkdir_p(&self, path: &str) -> AppResult<()> {
+        if path.is_empty() || path == "/" {
+            return Ok(());
+        }
+        if let Ok(meta) = self.sftp.metadata(path).await {
+            // A non-directory occupying the target path would cause obscure
+            // failures later when the upload tries to write under it.
+            if !meta.is_dir() {
+                return Err(AppError::sftp(
+                    "sftp_io_failed",
+                    json!({ "op": "mkdir_p", "path": path, "err": "path exists but is not a directory" }),
+                ));
+            }
+            return Ok(());
+        }
+        let mut current = String::new();
+        for part in path.split('/').filter(|s| !s.is_empty()) {
+            current.push('/');
+            current.push_str(part);
+            if let Err(create_err) = self.sftp.create_dir(&current).await {
+                // Race-safe fallback: verify a directory now exists.
+                match self.sftp.metadata(&current).await {
+                    Ok(meta) if meta.is_dir() => {} // created by a concurrent peer
+                    _ => {
+                        return Err(AppError::sftp(
+                            "sftp_io_failed",
+                            json!({ "op": "mkdir_p", "path": &current, "err": create_err.to_string() }),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stream-upload a local file to a remote path, emitting progress events.
@@ -324,6 +515,15 @@ impl SftpHandle {
         let total = local_meta.len();
 
         let mut local_file = tokio::fs::File::open(local_path).await?;
+
+        // When uploading a folder via multi-select, remote_path may live in a
+        // remote subdirectory we haven't created yet. For a single-file upload
+        // the parent already exists, so mkdir_p hits the hot-path early return.
+        if let Some((parent, _)) = remote_path.rsplit_once('/') {
+            if !parent.is_empty() {
+                self.mkdir_p(parent).await?;
+            }
+        }
 
         let mut remote_file = self
             .sftp

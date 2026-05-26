@@ -20,7 +20,8 @@
     import ChatPanel from "../ai/ChatPanel.svelte";
     import * as ai from "../ai/store.svelte.ts";
     import {attachShortcuts, attachKeyup, type Shortcut} from "../keyboard/registry.ts";
-    import {t} from "../i18n/index.svelte.ts";
+    import {t, errMsg} from "../i18n/index.svelte.ts";
+    import {toast} from "../stores/toast.svelte.ts";
 
     let drawerOpen = $state(false);
     let focusIdx = $state(-1);
@@ -158,8 +159,10 @@
         app.addTab({type: "local", id: tabId, label: t("ai.handoff.tab_label"), meta: {}});
         ai.openPanel();
 
-        // 2. 等本地 PTY 就绪（TerminalPane 异步 spawn + setSession）。300ms × 100 = 30s 上限
-        const sid = await waitFor(() => app.sessionIdForTab(tabId), 300, 100);
+        // 2. Wait for the local PTY to register itself. The store fires
+        //    this Promise the moment registerSession runs in TerminalPane —
+        //    no polling. 30 s timeout still covers a stuck spawn.
+        const sid = await app.waitForSession(tabId, 30000);
         if (!sid) {
             console.error("AI handoff: 本地 PTY 30s 内未就绪，放弃");
             return;
@@ -184,15 +187,6 @@
         } catch (e) {
             console.error("AI handoff failed:", e);
         }
-    }
-
-    async function waitFor<T>(probe: () => T | undefined, intervalMs: number, maxTries: number): Promise<T | undefined> {
-        for (let i = 0; i < maxTries; i++) {
-            const v = probe();
-            if (v !== undefined) return v;
-            await new Promise(r => setTimeout(r, intervalMs));
-        }
-        return undefined;
     }
 
     /* Consume window.__rssh_clone injected by open_tab_in_new_window */
@@ -227,8 +221,6 @@
         const tab = app.activeTab();
         if (app.settingsActive()) {
             getCurrentWindow().setTitle("Settings");
-        } else if (app.downloadsActive()) {
-            getCurrentWindow().setTitle(t("downloads.title"));
         } else if (tab) {
             const termTitle = app.terminalTitle(tab.id);
             const title = termTitle ? `${tab.label} — ${termTitle}` : tab.label;
@@ -236,6 +228,8 @@
         } else {
             getCurrentWindow().setTitle("RSSH");
         }
+        // The Transfers popover does not touch the window title — it is an
+        // overlay, not a route.
     });
 
     let pinnedProfiles = $derived(
@@ -254,7 +248,7 @@
         && (aiActiveTab.type === "ssh" || aiActiveTab.type === "local")
         && !!aiSessionId
         && !app.settingsActive()
-        && !app.downloadsActive()
+        // The Transfers popover does not affect AI panel visibility — overlay.
     );
     let xferBadge = $derived.by(() => {
         const n = transfers.activeCount();
@@ -266,7 +260,8 @@
     // sftpVisible 只控制 aside 视觉是否展开 + 哪个 pane 显示 —— 切到无 SFTP 的 tab 时实例不 unmount。
     let sftpTabs = $derived(app.tabsWithSftp());
     let sftpVisible = $derived(
-        !app.settingsActive() && !app.downloadsActive() && app.sftpOpen()
+        !app.settingsActive() && app.sftpOpen()
+        // The Transfers popover does not hide SFTP — overlay.
     );
 
     /* ── AI 面板宽度：用户拖拽 → localStorage，覆盖响应式默认值。
@@ -423,9 +418,11 @@
     }
 
     function isActiveItem(item: NavItem): boolean {
-        if (item.kind === "tab") return !app.settingsActive() && !app.downloadsActive() && item.tab.id === app.activeTabId();
+        if (item.kind === "tab") return !app.settingsActive() && item.tab.id === app.activeTabId();
         if (item.kind === "settings") return app.settingsActive();
-        if (item.kind === "downloads") return app.downloadsActive();
+        // Downloads is a popover, not a route. "active" only tracks real
+        // routes (home / settings). The open/closed state surfaces through
+        // the badge instead of taking sidebar active highlight.
         return false;
     }
 
@@ -506,7 +503,8 @@
     }
 
     function selectDownloads() {
-        app.openDownloads();
+        // Popover: every click on the sidebar entry toggles open/closed.
+        app.toggleDownloads();
         closeDrawer();
     }
 
@@ -559,10 +557,13 @@
         const isSsh = tab.type === "ssh";
         const sections: CtxMenuItem[][] = [];
 
-        // Copy / Paste (+ UTC if selection is a timestamp).
+        // Copy / Paste (+ UTC if selection is a timestamp) / Add-to-Snippets.
         if (isTerminal) {
             const selection = app.terminalGetSelection(tab.id);
-            const ts = selection ? tryParseTimestamp(selection) : null;
+            const trimmed = selection?.trim() ?? "";
+            // Parse the trimmed selection so timestamps with leading/trailing
+            // whitespace still surface the UTC copy action.
+            const ts = trimmed ? tryParseTimestamp(trimmed) : null;
             const copyPaste: CtxMenuItem[] = [
                 {
                     label: t("tab.context.copy"),
@@ -581,6 +582,25 @@
                     onClick: () => { navigator.clipboard.writeText(utc).catch(() => {}); },
                 });
             }
+            // Save the selected text as a command snippet: name = first 10
+            // chars, command = the full selection. All-whitespace selections
+            // are disabled — a 10-space-named snippet has no value.
+            copyPaste.push({
+                label: t("tab.context.add_to_snippets"),
+                disabled: !trimmed,
+                onClick: async () => {
+                    if (!trimmed) return;
+                    const name = trimmed.slice(0, 10);
+                    try {
+                        const all = await app.loadSnippets();
+                        all.push({ name, command: trimmed });
+                        await invoke("save_snippets", { snippets: all });
+                        toast.success(`${t("tab.context.add_to_snippets")}: ${name}`);
+                    } catch (e) {
+                        toast.error(`${t("toast.error.save")}: ${errMsg(e)}`);
+                    }
+                },
+            });
             sections.push(copyPaste);
         }
 
@@ -707,6 +727,10 @@
 
     function handleKeydown(e: KeyboardEvent) {
         if (e.key === "Escape") {
+            // The Transfers popover has its own Esc handler. When it's open,
+            // a single Esc should only close the topmost overlay (the popover),
+            // not also collapse SFTP/drawer underneath it.
+            if (app.downloadsActive()) return;
             if (app.sftpOpen()) { app.closeSftp(); e.preventDefault(); }
             else if (drawerOpen) { closeDrawer(); e.preventDefault(); }
         }
@@ -856,15 +880,11 @@
                 <div class="pane visible">
                     <SettingsLayout/>
                 </div>
-            {:else if app.downloadsActive()}
-                <div class="pane visible">
-                    <DownloadsScreen/>
-                </div>
             {/if}
 
             {#each app.tabs() as tab (tab.id)}
                 <div class="pane"
-                     class:visible={!app.settingsActive() && !app.downloadsActive() && tab.id === app.activeTabId()}
+                     class:visible={!app.settingsActive() && tab.id === app.activeTabId()}
                      oncontextmenu={app.isMobile ? undefined : (e) => openCtxMenu(e, tab)}>
                     {#if tab.type === "home"}
                         <HomeScreen/>
@@ -896,6 +916,13 @@
             </aside>
         {/if}
     </div>
+
+    <!-- Popover lives inside .shell so it inherits the --sb-* layout vars that
+         drive its edge offsets. position:fixed still anchors to the viewport
+         because .shell does not create a fixed-positioning containing block. -->
+    {#if app.downloadsActive()}
+        <DownloadsScreen/>
+    {/if}
 </div>
 
 <style>

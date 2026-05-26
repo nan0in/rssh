@@ -60,7 +60,14 @@ export interface Forward {
 }
 export interface Snippet { name: string; command: string; }
 export interface HighlightRule { keyword: string; color: string; enabled: boolean; }
-export interface RemoteEntry { name: string; is_dir: boolean; size: number; }
+export interface RemoteEntry {
+    name: string;
+    is_dir: boolean;
+    is_symlink: boolean;
+    size: number;
+    /** unix epoch seconds; 0 means server didn't provide mtime */
+    mtime: number;
+}
 
 /* ═══════════════════════════════════════════════════════
    Reactive state
@@ -76,9 +83,49 @@ let _editingId = $state<string | null>(null);
    新开 tab 不自动开 SFTP——每个 tab 手动开。
    (老的全局 _sftpOpen 已废，那是 fullscreen overlay 时代的产物。) */
 let _sftpOpenByTab = $state<Record<string, boolean>>({});
-/* Background transfers screen — sibling of settings, mutually exclusive */
+/* Transfers popover: an overlay, no longer a sibling route of Settings.
+   State is independent — switching tabs / opening Settings does not close it;
+   the user must dismiss explicitly (X / click outside / Esc / re-click entry).
+   The variable name keeps `_downloadsActive` because the sidebar entry id is
+   still "downloads" — renaming buys little. */
 let _downloadsActive = $state(false);
-let _pinnedProfileIds = $state<string[]>(JSON.parse(localStorage.getItem("pinned_profiles") ?? "[]"));
+/**
+ * Read a JSON-encoded array of strings from localStorage. Returns [] on any
+ * failure (key missing, value not JSON, value not an array). Module-load
+ * code path — a raw `JSON.parse` would throw and white-screen the app on
+ * any corruption (extension wrote garbage, user fiddled in DevTools).
+ */
+function loadStringArray(key: string): string[] {
+    try {
+        const raw = localStorage.getItem(key);
+        if (raw === null) return [];
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.filter((v) => typeof v === "string") : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Best-effort localStorage write. Symmetric with `loadStringArray` on the
+ * read side. Swallows QuotaExceededError (Safari private mode caps), SecurityError
+ * (enterprise GPO disables storage), and any other DOMException. The state in
+ * memory is already updated by the caller — failing to persist degrades to
+ * "preference resets on next reload", not "UI throws and Promise chain breaks".
+ *
+ * Use for preference-style writes where a lost setting is annoying but not
+ * destructive. NOT for anything where losing the write means losing data.
+ */
+function safeSetItem(key: string, value: string) {
+    try {
+        localStorage.setItem(key, value);
+    } catch (e) {
+        // One warn per failure is enough; don't spam if quota stays exceeded.
+        console.warn(`[app] localStorage setItem(${key}) failed:`, e);
+    }
+}
+
+let _pinnedProfileIds = $state<string[]>(loadStringArray("pinned_profiles"));
 
 /* Terminal title (from remote shell OSC sequence), separate from tab label */
 let _terminalTitles = $state<Record<string, string>>({});
@@ -104,15 +151,14 @@ export function terminalTitle(tabId: string) { return _terminalTitles[tabId]; }
 export function setActiveTab(id: string) {
   _activeTabId = id;
   _settingsActive = false;
-  _downloadsActive = false;
   // SFTP per-tab：切 tab 不动其他 tab 的 SFTP 状态（mirror AI panel 的"跨导航持久"模型）
+  // Transfers popover state persists across tab switches; closed only by user.
 }
 
 export function addTab(tab: Tab) {
   _tabs.push(tab);
   _activeTabId = tab.id;
   _settingsActive = false;
-  _downloadsActive = false;
 }
 
 export function moveTab(fromIdx: number, toIdx: number) {
@@ -153,16 +199,15 @@ export function setTerminalTitle(tabId: string, title: string) {
 /* ─── Settings Navigation ─── */
 export function openSettings() {
   _settingsActive = true;
-  _downloadsActive = false;
   // SFTP 不强制关 —— settings 路径下走可见性 derived 隐藏，state 保留
+  // Transfers popover state is independent — leave it untouched here.
 }
 
-export function openDownloads() {
-  _downloadsActive = true;
-  _settingsActive = false;
-}
-
+/** Open the transfers popover. State is independent from settings/tab — the
+ *  popover is itself an overlay. */
+export function openDownloads() { _downloadsActive = true; }
 export function closeDownloads() { _downloadsActive = false; }
+export function toggleDownloads() { _downloadsActive = !_downloadsActive; }
 
 export function settingsNavigate(page: SettingsPage, editId?: string) {
   _settingsPage = page;
@@ -193,10 +238,10 @@ export function sidebarPosition(): SidebarPosition {
 export function setSidebarPosition(pos: SidebarPosition) {
   if (isMobile) {
     _sidebarPosMobile = pos;
-    localStorage.setItem(_SB_KEY_MOBILE, pos);
+    safeSetItem(_SB_KEY_MOBILE, pos);
   } else {
     _sidebarPosDesktop = pos;
-    localStorage.setItem(_SB_KEY_DESKTOP, pos);
+    safeSetItem(_SB_KEY_DESKTOP, pos);
   }
 }
 
@@ -262,11 +307,45 @@ export interface SessionInfo extends SessionEntry {
 }
 let _sessions = $state<SessionEntry[]>([]);
 
+/**
+ * Pending `waitForSession` calls keyed by tabId. A poll-loop in AppShell
+ * used to busy-check `sessionIdForTab` every 300 ms for up to 30 s; we
+ * own the state, so we can just notify when registerSession fires.
+ */
+const _sessionWaiters: Map<string, Array<(sid: string | null) => void>> = new Map();
+
 export function registerSession(info: SessionEntry) {
   _sessions = [..._sessions.filter(s => s.tabId !== info.tabId), info];
+  const waiters = _sessionWaiters.get(info.tabId);
+  if (waiters && waiters.length) {
+    _sessionWaiters.delete(info.tabId);
+    for (const fn of waiters) fn(info.sessionId);
+  }
 }
 export function unregisterSession(tabId: string) {
   _sessions = _sessions.filter(s => s.tabId !== tabId);
+}
+
+/**
+ * Resolve when a session is registered for `tabId`. `null` after `timeoutMs`
+ * if the session never appears (e.g. PTY spawn failure). Replaces a 30s
+ * setInterval poll — the store is the source of truth, no reason to spin.
+ */
+export function waitForSession(tabId: string, timeoutMs = 30000): Promise<string | null> {
+  const existing = sessionIdForTab(tabId);
+  if (existing) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    let done = false;
+    const fire = (val: string | null) => {
+      if (done) return;
+      done = true;
+      resolve(val);
+    };
+    const arr = _sessionWaiters.get(tabId) ?? [];
+    arr.push(fire);
+    _sessionWaiters.set(tabId, arr);
+    setTimeout(() => fire(null), timeoutMs);
+  });
 }
 export function connectedSessions(): SessionInfo[] {
   return _sessions.map(s => ({
@@ -339,7 +418,7 @@ export function closeSftp() {
 }
 
 /* ─── Pinned profiles ─── */
-function savePins() { localStorage.setItem("pinned_profiles", JSON.stringify(_pinnedProfileIds)); }
+function savePins() { safeSetItem("pinned_profiles", JSON.stringify(_pinnedProfileIds)); }
 export function pinProfile(id: string) {
   if (!_pinnedProfileIds.includes(id)) { _pinnedProfileIds.push(id); savePins(); }
 }
@@ -376,6 +455,22 @@ export async function loadSnippets(): Promise<Snippet[]> {
 export async function loadHighlights(): Promise<HighlightRule[]> {
   return invoke<HighlightRule[]>("list_highlights");
 }
+
+/**
+ * Bumped whenever the user adds/removes/resets a highlight rule via
+ * HighlightManager. TerminalPane reads this in a `$effect` and reloads
+ * its rule cache + recompiles its regex. Without this, every highlight
+ * edit silently fails until the user reconnects the terminal — the kind
+ * of "did this even save?" bug that erodes trust.
+ *
+ * A revision counter (not the full rule list) lives in the store so
+ * consumers can subscribe with a single reactive dep regardless of how
+ * the underlying list mutates, and so we don't double-store the rules
+ * (DB is the source of truth; this is just a "go re-read" signal).
+ */
+let _highlightsRevision = $state(0);
+export function highlightsRevision(): number { return _highlightsRevision; }
+export function bumpHighlights() { _highlightsRevision += 1; }
 export async function loadGroups(): Promise<Group[]> {
   return invoke<Group[]>("list_groups");
 }

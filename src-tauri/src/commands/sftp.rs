@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -6,8 +8,11 @@ use tauri::State;
 
 use crate::error::{locked, AppError, AppResult};
 use crate::models::{Credential, CredentialType};
-use crate::ssh::sftp::{RemoteEntry, SftpHandle};
+use crate::ssh::sftp::{RemoteEntry, SftpHandle, WalkEntry};
 use crate::state::AppState;
+
+/// Maximum recursion depth for the local walker. Mirrors the remote-side cap.
+const LOCAL_WALK_DEPTH_CAP: u32 = 32;
 
 /// RAII：注册 cancel flag 并在 drop 时自动 unregister，无论 streaming 正常返回、
 /// 早 `?`、还是 panic。替代旧的手写 register/unregister 配对。
@@ -116,6 +121,85 @@ pub async fn sftp_list(
 ) -> AppResult<Vec<RemoteEntry>> {
     let h = get_sftp(&state, &sftp_id)?;
     h.list_dir(&path).await
+}
+
+/// Recursively list every file under a remote directory (symlink-to-file is
+/// followed, symlink-to-dir is skipped to prevent cycles). The frontend queues
+/// each returned entry as an independent Transfer; the directory abstraction
+/// exists only inside this command.
+#[tauri::command]
+pub async fn sftp_walk_remote_dir(
+    state: State<'_, AppState>,
+    sftp_id: String,
+    remote_root: String,
+) -> AppResult<Vec<WalkEntry>> {
+    let h = get_sftp(&state, &sftp_id)?;
+    h.walk_files(&remote_root).await
+}
+
+/// Recursively list every file under a local directory; the local-side
+/// counterpart of `sftp_walk_remote_dir`. `rel_path` always uses '/'; the
+/// frontend swaps the separator when rebuilding the local physical path.
+#[tauri::command]
+pub async fn walk_local_dir(local_root: String) -> AppResult<Vec<WalkEntry>> {
+    let root = PathBuf::from(&local_root);
+    let mut queue: VecDeque<(PathBuf, u32)> = VecDeque::new();
+    queue.push_back((root.clone(), 0));
+    let mut result: Vec<WalkEntry> = Vec::new();
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth >= LOCAL_WALK_DEPTH_CAP {
+            return Err(AppError::other(
+                "local_tree_too_deep",
+                json!({
+                    "path": dir.display().to_string(),
+                    "depth": depth,
+                    "limit": LOCAL_WALK_DEPTH_CAP,
+                }),
+            ));
+        }
+        let mut rd = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            // `entry.metadata()` does not traverse symlinks — single syscall
+            // covers both type discrimination and size for regular files,
+            // replacing the previous file_type() + metadata() double-stat.
+            let path = entry.path();
+            let meta = entry.metadata().await?;
+            if meta.is_dir() {
+                queue.push_back((path, depth + 1));
+            } else if meta.is_file() {
+                result.push(WalkEntry {
+                    rel_path: rel_unix(&path, &root),
+                    size: meta.len(),
+                });
+            } else if meta.is_symlink() {
+                // Follow once to learn what the target is. Skip symlink-to-dir
+                // to avoid cycles, and silently skip broken symlinks.
+                if let Ok(target_meta) = tokio::fs::metadata(&path).await {
+                    if target_meta.is_file() {
+                        result.push(WalkEntry {
+                            rel_path: rel_unix(&path, &root),
+                            size: target_meta.len(),
+                        });
+                    }
+                }
+            }
+            // Anything else (block/char/fifo): skip.
+        }
+    }
+    Ok(result)
+}
+
+/// Convert the portion of `full` relative to `root` into a '/'-separated string.
+/// On Windows std::path::Component uses '\'; we normalise here and the frontend
+/// converts back to the platform separator when joining.
+fn rel_unix(full: &Path, root: &Path) -> String {
+    let stripped = full.strip_prefix(root).unwrap_or(full);
+    stripped
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[tauri::command]
@@ -232,6 +316,25 @@ pub async fn sftp_pick_save_path(default_name: String) -> AppResult<Option<Strin
 pub async fn sftp_pick_open_path() -> AppResult<Option<String>> {
     let handle = rfd::AsyncFileDialog::new().pick_file().await;
     Ok(handle.map(|h| h.path().display().to_string()))
+}
+
+/// Pick a folder via the native dialog. Used both as the destination root
+/// (multi-select download) and the source root (recursive upload) — both
+/// flows want the same rfd `pick_folder()` call, so a single command suffices.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub async fn sftp_pick_folder() -> AppResult<Option<String>> {
+    let handle = rfd::AsyncFileDialog::new().pick_folder().await;
+    Ok(handle.map(|h| h.path().display().to_string()))
+}
+
+/// Pick multiple source files for upload. rfd's `pick_files` supports
+/// multi-selection on every platform we ship to.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub async fn sftp_pick_open_files() -> AppResult<Option<Vec<String>>> {
+    let handles = rfd::AsyncFileDialog::new().pick_files().await;
+    Ok(handles.map(|hs| hs.into_iter().map(|h| h.path().display().to_string()).collect()))
 }
 
 /// Stream-download to a caller-supplied local path. transfer_id is used as the

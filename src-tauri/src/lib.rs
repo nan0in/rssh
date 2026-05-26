@@ -39,7 +39,7 @@ pub fn run() {
             #[cfg(target_os = "android")]
             let data_dir = app.path().app_data_dir()?;
             #[cfg(not(target_os = "android"))]
-            let data_dir = db::data_dir();
+            let data_dir = db::data_dir()?;
             let db = Arc::new(db::Db::open(&data_dir)?);
             // secret::open 可能失败：sticky backend 标记 keyring 但 keychain 现在
             // 拿不到（系统 keychain 损坏 / D-Bus 挂等）→ 硬 fail 启动。silently
@@ -112,6 +112,7 @@ pub fn run() {
             commands::settings::list_highlights,
             commands::settings::add_highlight,
             commands::settings::remove_highlight,
+            commands::settings::update_highlight,
             commands::settings::load_snippets,
             commands::settings::save_snippets,
             commands::settings::reset_highlights,
@@ -147,6 +148,8 @@ pub fn run() {
             commands::sftp::sftp_connect_session,
             commands::sftp::sftp_home,
             commands::sftp::sftp_list,
+            commands::sftp::sftp_walk_remote_dir,
+            commands::sftp::walk_local_dir,
             commands::sftp::sftp_download,
             commands::sftp::sftp_upload,
             commands::sftp::sftp_mkdir,
@@ -160,6 +163,10 @@ pub fn run() {
             commands::sftp::sftp_pick_save_path,
             #[cfg(not(target_os = "android"))]
             commands::sftp::sftp_pick_open_path,
+            #[cfg(not(target_os = "android"))]
+            commands::sftp::sftp_pick_folder,
+            #[cfg(not(target_os = "android"))]
+            commands::sftp::sftp_pick_open_files,
             #[cfg(not(target_os = "android"))]
             commands::sftp::sftp_download_to,
             #[cfg(not(target_os = "android"))]
