@@ -32,8 +32,30 @@
     // 走 ai.settings() 读 store 的 $state，自动响应式（不需要手动 loadSettings 触发）。
     let dangerMode = $derived(ai.settings()?.danger_mode === true);
 
-    onMount(() => {
-        if (!ai.settings()) ai.loadSettings().catch(() => {});
+    onMount(async () => {
+        // 先把 settings 拉回来（提示词标题用的 danger 旗，profile 探测开关都要它）。
+        if (!ai.settings()) {
+            try { await ai.loadSettings(); } catch { /* 静默 */ }
+        }
+        // 远端 SSH + auto_detect on + 还没 session + 已配 API key →
+        // 主动启动 session 触发探测。这是用户开 toggle 的代价：
+        // 开 panel 就启 actor 跑一行 echo 探针，识别 cmd / PowerShell。
+        // 无 API key 时启动必失败，跳过避免每次开 panel 都弹错误。
+        const s = ai.settings();
+        if (
+            !session
+            && targetKind === "ssh"
+            && s?.auto_detect_remote_shell
+            && s?.has_api_key
+        ) {
+            try {
+                await ensureSession();
+            } catch (e) {
+                // fire-and-forget：探测预热失败不打扰用户。真正发消息时 send()
+                // 会再走一次 ensureSession 把错误塞到 banner。
+                console.warn("[ai] auto-probe session start failed:", e);
+            }
+        }
     });
 
     $effect(() => {
@@ -43,18 +65,37 @@
         }
     });
 
+    /** 单飞 guard：onMount 预热 + send() 都会调 ensureSession，并发时两次都看不到
+     *  session 存在（store 写入是 startSession 完成后才落），双 startSession 后端会
+     *  报 session_already_exists。promise 复用：第二个调用方等同一个 promise 完成。 */
+    let ensureInFlight: Promise<void> | null = null;
+
     /** 没 session 就先启动；启动失败抛错。
-     *  skill 固定 general —— 用户自定义 skill 已自动拼进 master prompt，让 LLM 自己路由。 */
+     *  skill 固定 general —— 用户自定义 skill 已自动拼进 master prompt，让 LLM 自己路由。
+     *  启动成功后，如果 info.probe_required（远端 SSH + auto_detect on + cache miss），
+     *  fire-and-forget 跑一次 shell 探测：用户看到一行 echo 滚过去，后台解析后调 set_shell。 */
     async function ensureSession(): Promise<void> {
         if (session) return;
-        const settings = ai.settings() ?? await ai.loadSettings();
-        if (!settings.has_api_key) {
-            throw new Error(t("ai.error.no_api_key"));
+        if (ensureInFlight) return ensureInFlight;
+        ensureInFlight = (async () => {
+            const settings = ai.settings() ?? await ai.loadSettings();
+            if (!settings.has_api_key) {
+                throw new Error(t("ai.error.no_api_key"));
+            }
+            const info = await ai.startSession({
+                tabId, targetKind, targetId, skill: "general",
+                provider: settings.provider, model: settings.model,
+            });
+            if (info.probe_required) {
+                // 失败也不阻塞 AI 启动 —— 后端 cfg.shell_kind 默认 POSIX 兜底。
+                void ai.probeRemoteShell(tabId, targetKind, targetId);
+            }
+        })();
+        try {
+            await ensureInFlight;
+        } finally {
+            ensureInFlight = null;
         }
-        await ai.startSession({
-            tabId, targetKind, targetId, skill: "general",
-            provider: settings.provider, model: settings.model,
-        });
     }
 
     async function send() {

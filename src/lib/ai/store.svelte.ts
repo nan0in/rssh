@@ -19,6 +19,7 @@ import type {
   CommandResult,
   LlmProvider,
   ModelInfo,
+  ShellKind,
   SkillRecord,
 } from "./types.ts";
 
@@ -183,6 +184,99 @@ export async function rebindTarget(
  *  这跟 stopSession（销毁整个会话）是两个语义。actor 不在 chat 时调用是 no-op。 */
 export async function cancelStream(tab_id: string): Promise<void> {
   await invoke("ai_cancel_stream", { tabId: tab_id });
+}
+
+/** 探测远端 shell：发一行 `echo P=$PSEdition=$$=E` 到 PTY，listen 1.5s 解析输出。
+ *
+ *  返回 true = 探测成功并已 invoke ai_session_set_shell（后端 cache + actor 都更新）。
+ *  返回 false = 超时 / classify 模糊 → 保持后端 POSIX 兜底，**不写 cache**（下次开 panel 可重探）。
+ *
+ *  时机：ChatPanel onMount / ensureSession 时，当 target=ssh + toggle on + cache miss。
+ *  视觉代价：用户会看到一行 echo 命令滚过终端。这是把 toggle 开开的代价。
+ *
+ *  正则反查表（基于 *输出行* 的 group1/group2）：
+ *    P=Desktop=*=E      → powershell (PS 5.1 Win / PS 7 Desktop edition)
+ *    P=Core=*=E         → powershell (PS 7 Core edition, 跨平台)
+ *    P=$PSEdition=$$=E  → cmd.exe (`$` 系变量全不展开)
+ *    P==<数字>=E        → posix      (bash/zsh/sh/dash/ksh/csh/tcsh: $PSEdition 空, $$ 是 PID)
+ *    其他               → null（不写 cache，下次重探）
+ *
+ *  PTY echo 坑：SSH 远端 PTY 默认 ECHO=on，会把我们粘进去的 `echo P=$PSEdition=$$=E`
+ *  原样回响一遍。所以 buffer 通常有两处 marker 匹配——**第一处是 echo 回显**（POSIX/PS
+ *  里 group1=`$PSEdition`），**第二处才是 shell 解析后的真实输出**。直接 `.match()` 会
+ *  命中 echo 行把 POSIX/PS 误判为 cmd（Copilot PR review 指出的 bug）。
+ *  → 用 `matchAll` 取第 2 个匹配。罕见 stty -echo 远端会只有 1 个匹配 → 超时兜底 POSIX。
+ */
+export async function probeRemoteShell(
+  tab_id: string,
+  target_kind: "ssh" | "local",
+  target_id: string,
+): Promise<boolean> {
+  if (target_kind !== "ssh") return false; // local 已知，无需探测
+  const writeCmd = "ssh_write";
+  const dataEvent = `ssh:data:${target_id}`;
+  const PROBE = "echo P=$PSEdition=$$=E";
+  const RE_GLOBAL = /P=([^=]*)=([^=]*)=E/g;
+
+  let buffer = "";
+  const unlisten = await listen<number[]>(dataEvent, (e) => {
+    buffer += new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(e.payload));
+  });
+  try {
+    await invoke(writeCmd, {
+      sessionId: target_id,
+      data: Array.from(new TextEncoder().encode(PROBE + "\r")),
+    });
+    // 1.5s deadline：远端通常 100-300ms 内回响，给 5x 头量容忍慢链路。
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      const matches = [...buffer.matchAll(RE_GLOBAL)];
+      // 取**最后一处**匹配 —— 兼顾两种 PTY 模式：
+      //   ECHO=on（默认）：[echo 回显, shell 输出] → last = shell 输出 ✓
+      //   ECHO=off（stty -echo 罕见）: [shell 输出] → last = shell 输出 ✓
+      // Copilot PR review 的优化：之前 hard-require >=2 会让 ECHO=off 远端永远超时。
+      if (matches.length >= 1) {
+        const [, psed, dollar] = matches[matches.length - 1];
+        const kind = classifyShell(psed, dollar);
+        if (kind === null) {
+          // 命中但 classify 模糊（如 PS 4.x：$PSEdition 不存在，$$ 是脏值）。
+          // 不调 set_shell 不写 cache —— 让下次开 panel 还能再试，避免锁错 shell。
+          console.warn(
+            "[ai] shell probe matched ambiguous signature, keeping POSIX fallback (not cached):",
+            { group1: psed, group2: dollar },
+          );
+          return false;
+        }
+        await invoke("ai_session_set_shell", {
+          tabId: tab_id,
+          targetId: target_id, // 让后端校验 target 没变（防 rebind/重连期间 stale probe）
+          shell: kind,
+        });
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    console.warn("[ai] shell probe timed out — keeping POSIX fallback");
+    return false;
+  } catch (e) {
+    console.error("[ai] shell probe failed:", e);
+    return false;
+  } finally {
+    unlisten();
+  }
+}
+
+/** 反查表：未识别返回 null（不写 cache，下次重探）。参考 probeRemoteShell 顶部对照表。 */
+function classifyShell(psed: string, dollar: string): ShellKind | null {
+  // PS 5+ 内置 $PSEdition 是 'Desktop' (Win PS) 或 'Core' (PS 7 Core)
+  if (psed === "Desktop" || psed === "Core") return "powershell";
+  // cmd.exe 完全不识别 `$`-style 变量，全字面输出
+  if (psed === "$PSEdition" && dollar === "$$") return "cmd";
+  // POSIX: $PSEdition 未定义展开为空，$$ 是 shell PID（数字）
+  if (psed === "" && /^\d+$/.test(dollar)) return "posix";
+  // 模糊：PS 4.x（$PSEdition 不存在）/ fish $$ 报错残留 / 自定义 prompt 干扰
+  // 不强行猜——返回 null，调用方走"不写 cache 不锁"分支，下次能重探。
+  return null;
 }
 
 /** 当前会话的助手消息是否正在流式输出 —— UI 用它把"发送"按钮切成"停止"。 */
@@ -415,6 +509,7 @@ export async function saveSettings(s: Partial<{
   autoPatchModify: boolean;
   autoPatchDiff: boolean;
   autoPatchMv: boolean;
+  autoDetectRemoteShell: boolean;
 }>) {
   await invoke("ai_settings_set", s);
   await loadSettings();
