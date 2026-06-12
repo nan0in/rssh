@@ -117,6 +117,14 @@ pub struct DiagnoseSession {
     /// commands 层从 slot 取 Notify 调 notify_one() —— 没在 chat 时 slot 为 None，发了也无副作用。
     /// 这样 cancel 永远只能取消"当前正在进行的 chat"，不会污染后续轮次。
     pub cancel_slot: Arc<Mutex<Option<Arc<Notify>>>>,
+    /// Persistent identity in ai_conversations (resume reuses the old id).
+    /// The front-end keys its timeline autosaves on this.
+    pub conversation_id: String,
+    /// Conversation scope ("ssh:<profile_id>" / "local" / "serial:<port>").
+    /// Fixed for the actor lifetime: rebind rejects a target whose key
+    /// differs, so a conversation row can never accumulate another scope's
+    /// transcript. Checked by commands layer, never read by the actor.
+    pub target_key: String,
 }
 
 pub struct SessionConfig {
@@ -153,6 +161,17 @@ pub struct SessionConfig {
     /// Remote SSH: the profile-level cache value if a connect-time probe hit
     /// (auto-detect on), else Posix.
     pub shell_kind: super::shell::ShellKind,
+    /// Conversation persistence. The actor autosaves `history` into
+    /// ai_conversations at every consistent commit point (paired
+    /// tool_use/tool_result). The row itself is created by session start
+    /// (commands layer) — autosaves are UPDATE-only, see db::ai_conversation.
+    pub db: Arc<crate::db::Db>,
+    pub conversation_id: String,
+    /// See DiagnoseSession.target_key — threaded through for the rebind scope
+    /// guard; the actor itself never reads it.
+    pub target_key: String,
+    /// Resumed conversations are born with their persisted history; new ones empty.
+    pub initial_history: Vec<ChatMessage>,
 }
 
 /// `build()` 构造出来的"待启动"会话：拿到了 DiagnoseSession（含 action_tx），
@@ -191,7 +210,7 @@ impl PendingSession {
 ///     g.insert(tab_id, pending.launch());
 /// }
 /// ```
-pub fn start(cfg: SessionConfig, app: crate::emitter::Host) -> AppResult<PendingSession> {
+pub fn start(mut cfg: SessionConfig, app: crate::emitter::Host) -> AppResult<PendingSession> {
     // system_prompt 是静态文本（rules + user-skill catalog + locale + 平台），
     // 整段不含运行期数据 —— 启动期一次性脱敏并缓存，避免每个 dialogue turn
     // 重跑一遍 regex。redact_rules 在会话生命周期内不变，所以安全。
@@ -218,12 +237,15 @@ pub fn start(cfg: SessionConfig, app: crate::emitter::Host) -> AppResult<Pending
         action_tx,
         audit: audit.clone(),
         cancel_slot: cancel_slot.clone(),
+        conversation_id: cfg.conversation_id.clone(),
+        target_key: cfg.target_key.clone(),
     };
 
+    let initial_history = std::mem::take(&mut cfg.initial_history);
     let actor = Actor {
         cfg,
         system_prompt,
-        history: Vec::new(),
+        history: initial_history,
         action_rx,
         audit,
         app,
@@ -263,6 +285,9 @@ impl Actor {
                     self.history.push(ChatMessage::User {
                         content: text.clone(),
                     });
+                    // Persist before the turn runs: a crash mid-turn must not
+                    // lose the message the user already typed.
+                    self.persist_history();
                     self.emit("user_message", json!({ "text": text }));
                     if let Err(e) = self.dialogue_turn().await {
                         self.audit_push(AuditKind::Error {
@@ -270,6 +295,9 @@ impl Actor {
                         });
                         self.emit("error", json!({ "message": e.to_string() }));
                     }
+                    // Covers the turn's terminal paths that push history without
+                    // reaching a loop commit (cancel marker, error placeholder).
+                    self.persist_history();
                 }
                 UserAction::ClearContext => {
                     // 清空对话历史。audit log 保留 —— "曾经发生过什么"是审计应当
@@ -282,6 +310,8 @@ impl Actor {
                     self.audit_push(AuditKind::Note {
                         message: format!("context cleared by user ({dropped} messages dropped)"),
                     });
+                    // The stored conversation mirrors actor state — cleared too.
+                    self.persist_history();
                     // 前端 listener 收到这个事件后清掉 _chatByTab[tab_id]，把气泡都抹掉。
                     self.emit("context_cleared", json!({}));
                 }
@@ -446,6 +476,10 @@ impl Actor {
                     //   被打断"，下轮别假定其有效。LLM 看的是后端 system prompt 风格
                     //   （英文），marker 跟着英文走更自然。
                     let partial = captured.lock().map(|g| g.clone()).unwrap_or_default();
+                    // No tokens_in/out here — known under-count. OpenAI-style
+                    // streams deliver usage only in the final chunk, which a
+                    // dropped future never receives; the panel's session total
+                    // therefore omits cancelled turns.
                     self.emit(
                         "assistant_message_end",
                         json!({ "id": msg_id, "text": partial, "cancelled": true }),
@@ -471,9 +505,17 @@ impl Actor {
                 }
             };
 
+            // tokens_in/out ride on the end event so the panel can show
+            // session spend. Pure tool_use turns (empty text) also emit —
+            // their tokens cost money too, the front-end must not miss them.
             self.emit(
                 "assistant_message_end",
-                json!({ "id": msg_id, "text": resp.text }),
+                json!({
+                    "id": msg_id,
+                    "text": resp.text,
+                    "tokens_in": resp.tokens_in,
+                    "tokens_out": resp.tokens_out,
+                }),
             );
 
             self.audit_push(AuditKind::LlmResponse {
@@ -500,6 +542,7 @@ impl Actor {
 
             if resp.tool_calls.is_empty() {
                 self.history.push(assistant);
+                self.persist_history();
                 return Ok(());
             }
 
@@ -526,6 +569,10 @@ impl Actor {
             }
 
             self.history.extend(pending);
+            // Persist each committed tool turn: approval waits can run minutes,
+            // and a crash there must not roll the conversation back to the
+            // previous user message.
+            self.persist_history();
         }
     }
 
@@ -1213,6 +1260,48 @@ impl Actor {
     pub(in crate::ai::session) fn audit_push(&self, kind: AuditKind) {
         if let Ok(mut g) = self.audit.lock() {
             g.push(kind);
+        }
+    }
+
+    /// Autosave `history` into ai_conversations. Call only at consistent
+    /// commit points — every tool_use paired with its tool_result — or a
+    /// resume of this snapshot gets 400-rejected by Anthropic.
+    ///
+    /// Persistence is a side feature: a failed disk write must not kill the
+    /// live conversation, so errors are logged, never propagated.
+    fn persist_history(&self) {
+        let json = match serde_json::to_string(&self.history) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("conversation serialize failed: {e}");
+                return;
+            }
+        };
+        // Title = first line of the first user message. Recomputed every save,
+        // so a cleared-then-restarted conversation re-titles itself.
+        let title: String = self
+            .history
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::User { content } => Some(
+                    content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Err(e) = crate::db::ai_conversation::save_history(
+            &self.cfg.db,
+            &self.cfg.conversation_id,
+            &title,
+            &json,
+        ) {
+            log::warn!("conversation persist failed: {e}");
         }
     }
 

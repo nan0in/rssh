@@ -776,7 +776,11 @@ async fn dispatch_async(
         }
         "sftp_rename" => {
             let h = sftp_handle(state, &arg::<String>(&args, "sftpId")?)?;
-            ok(h.rename(&arg::<String>(&args, "oldPath")?, &arg::<String>(&args, "newPath")?).await)
+            ok(h.rename(
+                &arg::<String>(&args, "oldPath")?,
+                &arg::<String>(&args, "newPath")?,
+            )
+            .await)
         }
         "sftp_stat" => {
             let h = sftp_handle(state, &arg::<String>(&args, "sftpId")?)?;
@@ -868,6 +872,9 @@ async fn dispatch_async(
                 arg(&args, "provider")?,
                 arg(&args, "model")?,
                 args.get("locale")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                args.get("resume")
                     .and_then(Value::as_str)
                     .map(str::to_string),
             )
@@ -985,6 +992,24 @@ async fn dispatch_async(
         "ai_remote_shell_probe_needed" => ok(
             crate::ai::commands::ai_remote_shell_probe_needed_impl(state, arg(&args, "targetId")?),
         ),
+        "ai_conversations_list" => ok(crate::ai::commands::ai_conversations_list_impl(
+            state,
+            &arg(&args, "target")?,
+        )),
+        "ai_conversation_timeline" => ok(crate::ai::commands::ai_conversation_timeline_impl(
+            state,
+            &arg::<String>(&args, "id")?,
+            &arg(&args, "target")?,
+        )),
+        "ai_conversation_save_timeline" => ok(crate::db::ai_conversation::set_timeline(
+            &state.db,
+            &arg::<String>(&args, "id")?,
+            &arg::<String>(&args, "timeline")?,
+        )),
+        "ai_conversation_delete" => ok(crate::ai::commands::ai_conversation_delete_impl(
+            state,
+            &arg::<String>(&args, "id")?,
+        )),
 
         // ---- GitHub config sync ----
         "github_push" => {
@@ -1295,11 +1320,18 @@ fn ai_rebind(state: &AppState, args: Value) -> Result<Value, Value> {
         }
     };
     let target_id = target.id().to_string();
+    // Same conversation-scope guard as the Tauri command — a cross-scope
+    // rebind would append this transcript into another scope's stored row.
+    let new_target_key =
+        crate::ai::commands::conversation_target_key(state, &target).map_err(err_value)?;
     let tx = {
         let mut g = locked(&state.ai_sessions).map_err(err_value)?;
         let s = g
             .get_mut(&tab_id)
             .ok_or_else(|| json!("ai_session_not_found"))?;
+        if s.target_key != new_target_key {
+            return Err(json!("conversation_target_mismatch"));
+        }
         s.target_id = target_id.clone();
         s.action_tx.clone()
     };

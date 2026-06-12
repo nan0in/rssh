@@ -79,6 +79,16 @@ export interface AiSessionInfo {
   skill: string;
   model: string;
   provider: LlmProvider;
+  /** ai_conversations 行 id —— timeline 自动保存按它写库；resume 沿用旧 id。 */
+  conversation_id: string;
+}
+
+/** 历史对话列表项（无 blob，给 picker 用）。时间戳为 epoch 毫秒。 */
+export interface ConversationMeta {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
 }
 
 /** 远端 shell 三家族 —— 跟 Rust 端 ShellKind 一对一镜像（lowercase wire format）。 */
@@ -91,6 +101,12 @@ export type ShellKind = "posix" | "cmd" | "powershell";
  * without a shell: no sentinel, no meaningful exit code, user-driven completion.
  */
 export type AiTargetKind = "ssh" | "local" | "serial";
+
+/** Cumulative token spend for one AI session (actor lifetime). */
+export interface TokenUsage {
+  tokens_in: number;
+  tokens_out: number;
+}
 
 /** 一条对话消息（前端展示用） */
 export type ChatItem =

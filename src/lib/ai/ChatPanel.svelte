@@ -1,9 +1,10 @@
 <script lang="ts">
     import * as ai from "./store.svelte.ts";
-    import type { AiTargetKind, ChatItem } from "./types.ts";
+    import type { AiTargetKind, ChatItem, ConversationMeta } from "./types.ts";
     import CommandConfirmDialog from "./CommandConfirmDialog.svelte";
     import AuditPanel from "./AuditPanel.svelte";
     import { renderMarkdown } from "./markdown.ts";
+    import { formatTokenCount } from "./tokens.ts";
     import { t, errMsg } from "../i18n/index.svelte.ts";
     import { onMount } from "svelte";
 
@@ -31,6 +32,12 @@
     // 危险模式标记 —— 用户在 AI Settings 里切换后，标题旁的红色后缀立刻同步。
     // 走 ai.settings() 读 store 的 $state，自动响应式（不需要手动 loadSettings 触发）。
     let dangerMode = $derived(ai.settings()?.danger_mode === true);
+    // 本会话累计 token 用量（actor 生命周期，清上下文不归零——花掉的钱不会退）。
+    let tokens = $derived(ai.tokenUsage(tabId));
+
+    // 该 profile 下持久化的历史对话 —— 仅会话未启动时展示（picker）。
+    // null = 还没加载完，与空数组（确无历史）区分，避免列表闪现。
+    let conversations = $state<ConversationMeta[] | null>(null);
 
     onMount(async () => {
         // 只拉 settings（提示词标题的 danger 旗等要它）。不在这里预启 session ——
@@ -39,6 +46,32 @@
         if (!ai.settings()) {
             try { await ai.loadSettings(); } catch { /* 静默 */ }
         }
+    });
+
+    // 历史对话随当前 target 重新加载 —— AppShell 复用同一个 ChatPanel 实例，
+    // 切 tab 只换 props 不重挂载，onMount 不会再跑，必须用 $effect 跟踪。
+    // seq 守卫：快速连续切 tab 时丢弃迟到的旧响应，避免 A 的列表盖到 B 头上。
+    let convSeq = 0;
+    $effect(() => {
+        const kind = targetKind;
+        const id = targetId;
+        if (session) return; // 会话已存在：picker 不展示，无需拉取
+        conversations = null;
+        const seq = ++convSeq;
+        // 两个回调都同时 gate seq + session：用户开面板后立刻发消息，会话先
+        // 起来、列表请求后返回 —— 此时 picker 已无意义，迟到的失败不该在活跃
+        // 对话里弹错误 banner（seq 不增长，单靠它挡不住这条路径）。
+        ai.listConversations(kind, id)
+            .then((list) => { if (seq === convSeq && !session) conversations = list; })
+            .catch((e) => {
+                // 加载失败不挡新对话，但必须上 banner —— 静默置空会让"有历史但
+                // 后端抽风"看起来跟"确无历史"一模一样，用户以为记录丢了。
+                console.error("[ai] list conversations:", e);
+                if (seq === convSeq && !session) {
+                    conversations = [];
+                    banner = errMsg(e);
+                }
+            });
     });
 
     $effect(() => {
@@ -75,6 +108,50 @@
         } finally {
             ensureInFlight = null;
         }
+    }
+
+    // 同一行的 resume / delete 互斥：删除进行中点恢复同一行会产生可避免的
+    // not_found 报错。按行互斥（不全局禁）—— 删 A 的几十毫秒里恢复 B 是合法操作。
+    let deletingId = $state<string | null>(null);
+
+    /** 点历史对话：actor 带旧 history 出生，UI 灌回存储的 timeline，直接可续聊。 */
+    async function resumeConversation(id: string) {
+        if (busy || session || deletingId === id) return;
+        banner = null;
+        busy = true;
+        try {
+            const settings = ai.settings() ?? await ai.loadSettings();
+            if (!settings.has_api_key) {
+                throw new Error(t("ai.error.no_api_key"));
+            }
+            await ai.resumeSession({
+                tabId, targetKind, targetId, skill: "general",
+                provider: settings.provider, model: settings.model,
+            }, id);
+        } catch (e: any) {
+            console.error("[ai] resume failed:", e);
+            banner = errMsg(e);
+        } finally {
+            busy = false;
+        }
+    }
+
+    async function deleteConversation(id: string) {
+        if (busy || deletingId) return;
+        deletingId = id;
+        try {
+            await ai.deleteConversation(id);
+            conversations = (conversations ?? []).filter((c) => c.id !== id);
+        } catch (e) {
+            console.error("[ai] delete conversation:", e);
+            banner = errMsg(e);
+        } finally {
+            deletingId = null;
+        }
+    }
+
+    function fmtDate(ms: number) {
+        return new Date(ms).toLocaleString();
     }
 
     async function send() {
@@ -149,28 +226,41 @@
 
 <div class="ai-panel">
     <div class="toolbar">
-        <span class="title">{t("ai.title")}</span>
         {#if dangerMode}
             <span class="title-danger" title={t("ai.title.danger_tip")}>{t("ai.title.danger_suffix")}</span>
         {/if}
-        {#if session}
-            <button class="btn btn-ghost btn-sm audit-toggle" onclick={() => (auditOpen = !auditOpen)}>
-                {auditOpen ? t("ai.toolbar.back_to_chat") : t("ai.toolbar.audit")}
-            </button>
-        {/if}
         <span class="grow"></span>
-        {#if session}
-            <!-- 清理上下文：仅会话存在时露出。SVG 扫帚图标（22×22）跟"×"视觉重心对齐。 -->
-            <button class="btn-icon" onclick={openClearDialog} title={t("ai.toolbar.clear_context")} aria-label={t("ai.toolbar.clear_context")}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M19.36 2.72l1.42 1.42-5.72 5.71-1.42-1.42 5.72-5.71z"/>
-                    <path d="M14.13 8.05l-6.36 6.36c-.78.78-2.05.78-2.83 0l-.71-.71c-.39-.39-.39-1.02 0-1.41l7.07-7.07c.39-.39 1.02-.39 1.41 0l.71.71c.78.78.78 2.04 0 2.82"/>
-                    <path d="M12 14l-3 7"/>
-                    <path d="M9 14l-1.5 7"/>
-                    <path d="M6 14l0 7"/>
-                </svg>
-            </button>
-        {/if}
+        <span class="tokens" title={t("ai.toolbar.tokens_tip", { tin: tokens.tokens_in, tout: tokens.tokens_out })}>
+            ↑{formatTokenCount(tokens.tokens_in)} ↓{formatTokenCount(tokens.tokens_out)}
+        </span>
+        <!-- Audit log toggle: file-text icon in chat view, chat bubble in audit view (= go back).
+             Toolbar controls render unconditionally (stable layout); they disable until the
+             session lazy-starts on first send — no actor, nothing to audit or clear. -->
+        <button class="btn-icon" onclick={() => (auditOpen = !auditOpen)} disabled={!session}
+                title={auditOpen ? t("ai.toolbar.back_to_chat") : t("ai.toolbar.audit")}
+                aria-label={auditOpen ? t("ai.toolbar.back_to_chat") : t("ai.toolbar.audit")}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                {#if auditOpen}
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                {:else}
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                    <polyline points="10 9 8 9"/>
+                {/if}
+            </svg>
+        </button>
+        <!-- 清理上下文：SVG 扫帚图标（22×22）跟"×"视觉重心对齐。 -->
+        <button class="btn-icon" onclick={openClearDialog} disabled={!session} title={t("ai.toolbar.clear_context")} aria-label={t("ai.toolbar.clear_context")}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M19.36 2.72l1.42 1.42-5.72 5.71-1.42-1.42 5.72-5.71z"/>
+                <path d="M14.13 8.05l-6.36 6.36c-.78.78-2.05.78-2.83 0l-.71-.71c-.39-.39-.39-1.02 0-1.41l7.07-7.07c.39-.39 1.02-.39 1.41 0l.71.71c.78.78.78 2.04 0 2.82"/>
+                <path d="M12 14l-3 7"/>
+                <path d="M9 14l-1.5 7"/>
+                <path d="M6 14l0 7"/>
+            </svg>
+        </button>
         <button class="btn-icon" onclick={closePanel} title={t("ai.toolbar.close_panel")} aria-label={t("ai.toolbar.close_panel")}>×</button>
     </div>
 
@@ -225,6 +315,25 @@
                     <p class="hint">{t("ai.placeholder.example_hint")}</p>
                     <p class="hint">{t("ai.placeholder.confirm_hint")}</p>
                 </div>
+                {#if conversations && conversations.length > 0}
+                    <div class="history">
+                        <div class="history-title">{t("ai.history.title")}</div>
+                        {#each conversations as c (c.id)}
+                            <div class="history-row">
+                                <button class="history-item" onclick={() => resumeConversation(c.id)}
+                                        disabled={busy || deletingId === c.id} title={t("ai.history.resume_tip")}>
+                                    <span class="history-name">{c.title || t("ai.history.untitled")}</span>
+                                    <span class="history-time">{fmtDate(c.updated_at)}</span>
+                                </button>
+                                <!-- 删除全局互斥（deletingId 只能追踪一个 in-flight），禁用范围
+                                     必须跟守卫一致：删除进行中所有删除按钮都禁，恢复按钮仍按行。 -->
+                                <button class="btn-icon history-del" onclick={() => deleteConversation(c.id)}
+                                        disabled={busy || deletingId !== null}
+                                        title={t("ai.history.delete")} aria-label={t("ai.history.delete")}>×</button>
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
             {/if}
         </div>
 
@@ -286,7 +395,6 @@
         padding: 8px; border-bottom: 1px solid var(--divider);
         flex-shrink: 0;
     }
-    .title { font-weight: 600; font-size: 13px; }
     .title-danger {
         font-size: 11px;
         font-weight: 600;
@@ -297,13 +405,11 @@
         background: color-mix(in srgb, var(--error) 8%, transparent);
     }
     .grow { flex: 1; }
-    /* 审计/对话同一颗按钮，label 在两种语言下宽度不一（"✎𓂃审计" vs "← 对话"，
-       "✎𓂃Audit" vs "← Chat"）。固定宽高让它在 toggle 时不抖动，也跟工具栏其他
-       元素的视觉重心稳定一致。padding 归零交给 .btn 的 flex 居中处理。 */
-    .audit-toggle {
-        width: calc(88px * var(--density));
-        height: calc(30px * var(--density));
-        padding: 0;
+    .tokens {
+        font-size: 10.5px;
+        font-family: monospace;
+        color: var(--text-dim);
+        white-space: nowrap;
         flex-shrink: 0;
     }
     .btn-primary { background: var(--accent); color: var(--white); border-color: var(--accent); }
@@ -328,6 +434,11 @@
         background: color-mix(in srgb, var(--text) 8%, transparent);
         color: var(--text);
     }
+    .btn-icon:disabled {
+        opacity: 0.35;
+        cursor: default;
+    }
+    .btn-icon:disabled:hover { background: transparent; }
     .banner {
         display: flex; align-items: center; gap: 8px;
         padding: 8px 12px;
@@ -344,8 +455,36 @@
         color: var(--text-dim);
         line-height: 1.6;
     }
-    .placeholder.dim { font-size: 13px; padding: 32px; }
+    .placeholder.dim { font-size: 13px; padding: 32px 32px 8px; }
     .hint { font-size: 12px; }
+
+    /* 历史对话 picker —— 仅空状态（无会话）时出现在欢迎语下方。 */
+    .history { padding: 0 16px; display: flex; flex-direction: column; gap: 2px; }
+    .history-title {
+        font-size: 11px; font-weight: 600; color: var(--text-dim);
+        text-transform: uppercase; letter-spacing: 0.05em;
+        margin: 8px 0 4px;
+    }
+    .history-row { display: flex; align-items: center; gap: 2px; }
+    .history-item {
+        flex: 1; min-width: 0;
+        display: flex; align-items: baseline; gap: 8px;
+        padding: 5px 8px;
+        background: transparent; border: none; cursor: pointer;
+        border-radius: 4px; color: var(--text);
+        text-align: left; font-size: 12.5px;
+    }
+    .history-item:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
+    .history-item:disabled { opacity: 0.5; cursor: default; }
+    .history-name {
+        flex: 1; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .history-time {
+        font-size: 10.5px; color: var(--text-dim);
+        font-family: monospace; flex-shrink: 0;
+    }
+    .history-del { font-size: 14px; padding: 2px 5px; color: var(--text-dim); }
 
     .chat {
         flex: 1; overflow-y: auto; padding: 6px;
