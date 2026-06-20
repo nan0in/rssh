@@ -400,6 +400,8 @@ const en = {
   "ai.toolbar.tokens_tip": "Session tokens: {tin} in / {tout} out (clearing context doesn't reset)",
   "ai.toolbar.close_panel": "Close panel (session preserved)",
   "ai.toolbar.close_session": "Close and end session",
+  "ai.toolbar.danger_aria": "Danger mode",
+  "ai.toolbar.danger_enable": "Enable Danger Mode",
   "ai.history.title": "Previous conversations",
   "ai.history.untitled": "(empty conversation)",
   "ai.history.resume_tip": "Resume this conversation",
@@ -468,7 +470,7 @@ const en = {
   "ai.cmd.alert.exec_failed": "Execute failed: {error}",
   "ai.cmd.alert.submit_failed": "Submit failed: {error}",
   "ai.cmd.patch.tag": "[AI patch]",
-  "ai.cmd.proposed.tag": "[AI proposed]",
+  "ai.cmd.proposed.tag": "[AI]",
 
   // ── AI Diagnose: AiSettings ──
   "ai.settings.warn.byok": "⚠️ BYOK: command output is sanitized locally before being sent to the LLM provider. The provider may use this data per their terms",
