@@ -46,13 +46,13 @@ export function installLocalFileDropNavigationGuard(target: Window = window): ()
     const preventDragOver = (event: DragEvent) => {
         if (!isLocalFileDrag(event.dataTransfer)) return;
         event.preventDefault();
-        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
     };
     const preventDrop = (event: DragEvent) => {
         const paths = localPathsFromDrop(event.dataTransfer);
         if (!isLocalFileDrag(event.dataTransfer) && paths.length === 0) return;
         event.preventDefault();
-        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
     };
     target.addEventListener("dragover", preventDragOver, { capture: true });
     target.addEventListener("drop", preventDrop, { capture: true });
